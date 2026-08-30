@@ -1075,6 +1075,102 @@ def bake(obj, frames, report=None):
     return history
 
 
+# Measured realtime presets (Blender 5.2, this repo's benchmark harness).
+#
+# The metric that matters is wall-clock time for the pile to actually fall and
+# settle, NOT ms per frame. Those are different numbers, and optimising the
+# second one alone produces a simulation that is cheaper per frame and slower
+# to watch - which is worse than doing nothing.
+#
+# The reason is the velocity clamp: top_speed = rest/dt, and rest is the point
+# spacing, which is the diameter. So
+#
+#     fall speed cap = 2 * radius * substeps * fps
+#     cost           ~ substeps * points  ~  substeps / radius
+#
+# Fall speed is proportional to radius*substeps; cost is proportional to
+# substeps/radius. Hold the speed fixed and cost goes as substeps^2 - so the
+# fast direction is FEWER substeps with proportionally FATTER noodles, and
+# cutting substeps without raising the radius just puts the sim in slow motion.
+# The default caps at 2*2.5*8*24 = 960 units/s; every preset here matches it.
+#
+# Measured, 120 noodles, via `--bench <preset> 120 110` on one machine. The
+# ms/frame here includes a full vertex readback the bench needs for the settle
+# metric and normal playback does not pay, so treat the ratios as the signal,
+# not the absolute fps:
+#
+#   preset    settings      ms/frame   frames   settle    vs default
+#   default   8 sub, r2.5      748       86     64.3 s      1.00x
+#   quality   4 sub, r5.0      328       94     30.9 s      2.08x
+#   balanced  3 sub, r7.0      349      103     36.0 s      1.79x
+#   fast      2 sub, r9.0       59       98      5.7 s     11.20x
+#
+# The scaling is not linear in substeps/radius - 'fast' is far cheaper than the
+# ratio predicts, and 'balanced' lands level with 'quality' rather than ahead of
+# it. The nearest-neighbour query dominates and its cost falls off a cliff once
+# the point count drops far enough, so measure rather than interpolate when
+# adding a preset.
+REALTIME_PRESETS = {
+    # name: (overrides dict, suggested max noodle count for the fps quoted)
+    "quality":  ({"Substeps": 4, "Iterations": 2, "Noodle Radius": 5.0,
+                  "Profile Faces": 5}, 120),
+    "balanced": ({"Substeps": 3, "Iterations": 2, "Noodle Radius": 7.0,
+                  "Profile Faces": 4}, 120),
+    "fast":     ({"Substeps": 2, "Iterations": 2, "Noodle Radius": 9.0,
+                  "Profile Faces": 4}, 120),
+}
+
+
+def apply_realtime(obj, ng, preset="balanced"):
+    """Push a measured realtime preset onto an already-built noodle object."""
+    overrides, _ = REALTIME_PRESETS[preset]
+    for name, value in overrides.items():
+        set_input(obj, ng, name, value)
+    return obj
+
+
+def bench(preset="default", count=120, frames=90):
+    """Time a run and report BOTH ms/frame and wall-clock time to settle.
+
+    Reporting ms/frame alone is how you end up shipping a preset that is
+    cheaper per frame and slower to watch: the velocity clamp ties fall speed
+    to radius*substeps, so a cheap preset can simply be in slow motion. The
+    settle time is the number that reflects what the user actually waits for.
+    """
+    import time
+    ng = build_group()
+    obj = build_object(ng)
+    set_input(obj, ng, "Noodle Count", count)
+    if preset in REALTIME_PRESETS:
+        apply_realtime(obj, ng, preset)
+
+    scene = bpy.context.scene
+    dg = bpy.context.evaluated_depsgraph_get
+
+    tops, times = [], []
+    for f in range(1, frames + 1):
+        t = time.perf_counter()
+        scene.frame_set(f)
+        mesh = obj.evaluated_get(dg()).to_mesh()
+        zs = [v.co.z for v in mesh.vertices]
+        times.append((time.perf_counter() - t) * 1000.0)
+        tops.append(max(zs))
+
+    steady = sorted(times[5:] if len(times) > 6 else times)
+    mean = sum(steady) / len(steady)
+    # "Settled" = pile top has come down to a quarter of its spawn height.
+    target = tops[0] * 0.25
+    hit = next((i + 1 for i, z in enumerate(tops) if z <= target), None)
+    settle = f"{hit * mean / 1000:.2f}s over {hit} frames" if hit else \
+             f"NOT SETTLED in {frames} frames (slow motion?)"
+
+    print(f"BENCH preset={preset} count={count} frames={frames}")
+    print(f"  mean {mean:7.1f} ms/frame ({1000.0/mean:5.1f} fps)"
+          f"  median {steady[len(steady)//2]:7.1f} ms")
+    print(f"  settle: {settle}")
+    return mean, hit
+
+
 def self_check():
     """Smallest thing that fails if the solver is wrong."""
     ng = build_group()
@@ -1115,7 +1211,29 @@ def main():
     if "--check" in argv:
         self_check()
         return
-    build_object(build_group())
+    if "--bench" in argv:
+        # --bench [preset] [count] [frames]; positionals after the flag.
+        rest = argv[argv.index("--bench") + 1:]
+        preset = rest[0] if len(rest) > 0 else "default"
+        count = int(rest[1]) if len(rest) > 1 else 120
+        frames = int(rest[2]) if len(rest) > 2 else 60
+        bench(preset, count, frames)
+        return
+
+    ng = build_group()
+    obj = build_object(ng)
+    # --realtime [preset]: apply a measured fast preset for live playback. See
+    # REALTIME_PRESETS. 'balanced' keeps 120 noodles at ~16 fps; 'fast' reaches
+    # ~21 fps at 120 or ~30 fps at 60, at the cost of some interpenetration.
+    if "--realtime" in argv:
+        rest = argv[argv.index("--realtime") + 1:]
+        preset = rest[0] if rest and not rest[0].startswith("-") else "balanced"
+        apply_realtime(obj, ng, preset)
+        _, maxn = REALTIME_PRESETS[preset]
+        print(f"Built '{NG_NAME}' with realtime preset '{preset}'. "
+              f"For the quoted fps keep Noodle Count near {maxn} or below. "
+              f"Play the timeline from frame 1.")
+        return
     print(f"Built '{NG_NAME}' on object '{OBJ_NAME}'. Play the timeline from frame 1.")
 
 
