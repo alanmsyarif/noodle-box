@@ -154,6 +154,9 @@ PARAMS = [
     ("Collider Collection", "NodeSocketCollection", None, None, None, None),
     ("Collider Margin", "NodeSocketFloat", 0.0,    0.0,   1e6,    "DISTANCE"),
     ("Collider Friction","NodeSocketFloat", 0.5,   0.0,   1.0,    "FACTOR"),
+    ("Collider Stickiness","NodeSocketFloat", 0.0,  0.0,   1.0,    "FACTOR"),
+    ("Sticky Collider", "NodeSocketCollection", None, None, None,   None),
+    ("Sticky Collider Grip","NodeSocketFloat", 0.8,  0.0,   1.0,    "FACTOR"),
     ("Start Height",    "NodeSocketFloat", 1250.0, 0.0,   1e6,    "DISTANCE"),
     ("Gravity",         "NodeSocketFloat", 386.0,  0.0,   1e6,    None),
     ("Damping",         "NodeSocketFloat", 0.03,   0.0,   1.0,    "FACTOR"),
@@ -201,6 +204,19 @@ DESCRIPTIONS = {
     "Collider Friction":
         "Friction against the collider, separate from noodle-on-noodle. A "
         "plate is slipperier than wet pasta on wet pasta",
+    "Sticky Collider":
+        "A second set of colliders with its own stickiness, for when one "
+        "number cannot cover the scene - chopsticks that lift noodles out of "
+        "a bowl that lets them go. Collides exactly like the first set; only "
+        "the grip differs. Costs a second distance field, about 8 ms a frame",
+    "Sticky Collider Grip":
+        "Stickiness for the Sticky Collider set only, leaving Collider "
+        "Stickiness to the bowls and plates",
+    "Collider Stickiness":
+        "How strongly noodles cling to the collider just past touching - what "
+        "lets strands lift with a chopstick or hang off a tilting plate. Free, "
+        "like Cohesion: it reuses the distance the contact already measured. "
+        "Raise Collider Friction alongside it, or they slide off sideways",
     "Length Variation":
         "Spread of noodle lengths about Noodle Length. Each noodle is "
         "resampled to its own length, so they all keep the point spacing "
@@ -595,36 +611,51 @@ def build_group():
     plug(joined.inputs["Geometry"], coll_real.outputs["Geometry"])
     collider = joined.outputs["Geometry"]
 
-    # Voxelise once per frame, not once per substep: this node depends only on
-    # the collider object and never on solver state, so it sits outside both
-    # zones and every Sample Grid inside them reads the one grid.
-    voxel = math("MULTIPLY", P["Noodle Radius"], SDF_VOXEL, 33, 7)
-    sdf = nd("GeometryNodeMeshToSDFGrid", 33, 8)
-    plug(sdf.inputs["Mesh"], collider)
-    plug(sdf.inputs["Voxel Size"], voxel)
-    plug(sdf.inputs["Band Width"], SDF_BAND)
-    grid = sdf.outputs["SDF Grid"]
+    # The sticky set. Everything inside one field shares one stickiness, which
+    # is the price of joining them, so a scene that needs two answers - a bowl
+    # that lets go, chopsticks that do not - needs two fields. Collision is
+    # identical either way; only the grip differs.
+    sticky_info = nd("GeometryNodeCollectionInfo", 32, 8, transform_space="RELATIVE")
+    plug(sticky_info.inputs["Collection"], P["Sticky Collider"])
+    plug(sticky_info.inputs["Separate Children"], False)
+    sticky_real = nd("GeometryNodeRealizeInstances", 33, 9)
+    plug(sticky_real.inputs["Geometry"], sticky_info.outputs["Instances"])
 
-    def sdf_at(p, col, row):
+    # Voxelise once per frame, not once per substep: these nodes depend only on
+    # the collider objects and never on solver state, so they sit outside both
+    # zones and every Sample Grid inside them reads the same grids.
+    voxel = math("MULTIPLY", P["Noodle Radius"], SDF_VOXEL, 33, 7)
+
+    def make_grid(geo, col, row):
+        n = nd("GeometryNodeMeshToSDFGrid", col, row)
+        plug(n.inputs["Mesh"], geo)
+        plug(n.inputs["Voxel Size"], voxel)
+        plug(n.inputs["Band Width"], SDF_BAND)
+        return n.outputs["SDF Grid"]
+
+    grid = make_grid(collider, 34, 8)
+    sticky_grid = make_grid(sticky_real.outputs["Geometry"], 34, 10)
+
+    def sdf_at(grid, p, col, row):
         n = nd("GeometryNodeSampleGrid", col, row, data_type="FLOAT")
         plug(n.inputs["Grid"], grid)
         plug(n.inputs["Position"], p)
         return n.outputs["Value"]
 
-    def sdf_probe(p, col, row):
+    def sdf_probe(grid, p, col, row):
         """Distance to the collider and the gradient of that distance.
 
         Six samples for the gradient, central differences one voxel either
         side. They are grid lookups rather than BVH descents, which is what
         makes asking seven times per constraint iteration affordable.
         """
-        d = sdf_at(p, col, row)
+        d = sdf_at(grid, p, col, row)
         axes = (xyz(voxel, 0.0, 0.0, col, row + 1),
                 xyz(0.0, voxel, 0.0, col, row + 2),
                 xyz(0.0, 0.0, voxel, col, row + 3))
         comps = [math("SUBTRACT",
-                      sdf_at(vmath("ADD", p, a, col + 1, row + 1 + i), col + 2, row + 1 + i),
-                      sdf_at(vmath("SUBTRACT", p, a, col + 1, row + 4 + i), col + 2, row + 4 + i),
+                      sdf_at(grid, vmath("ADD", p, a, col + 1, row + 1 + i), col + 2, row + 1 + i),
+                      sdf_at(grid, vmath("SUBTRACT", p, a, col + 1, row + 4 + i), col + 2, row + 4 + i),
                       col + 3, row + 1 + i)
                  for i, a in enumerate(axes)]
         return d, xyz(comps[0], comps[1], comps[2], col + 4, row + 1)
@@ -845,29 +876,59 @@ def build_group():
     # point that gets pushed through is then pushed further out rather than
     # back - a thin bowl leaks half the pile. Give it thickness; a Solidify
     # modifier on the same bowl holds everything.
-    d_i, grad_i = sdf_probe(position, 55, 8)
-    # Outside the narrow band the grid is a constant, so the gradient is
-    # exactly zero. That doubles as the "is there a collider at all" test:
-    # with none assigned the grid is empty, the gradient is zero, and both the
-    # push and the friction below multiply out to nothing.
-    in_band = math("GREATER_THAN", vmath("LENGTH", grad_i, None, 60, 10),
-                   voxel, 61, 10)
-    clear = math("MULTIPLY",
-                 math("SUBTRACT", collider_gap, d_i, 60, 8),
-                 math("MULTIPLY", math("LESS_THAN", d_i, collider_gap, 60, 9),
-                      in_band, 61, 9), 62, 8)
-    solve = set_position(
-        solve, vmath("ADD", position,
-                     vmath("SCALE", vmath("NORMALIZE", grad_i, None, 62, 10),
-                           clear, 63, 10), 64, 10), 65, 1)
-    # What the friction stage needs, taken from the probe already paid for.
-    # Parked far away outside the band, so points nowhere near a collider read
-    # as "not touching" rather than as "sitting on the surface".
-    solve = store(solve, ATTR_CDIST,
-                  math("ADD", d_i,
-                       math("MULTIPLY", 1e9,
-                            math("SUBTRACT", 1.0, in_band, 63, 12), 64, 12), 65, 12),
-                  "FLOAT", 66, 12)
+    # Stickiness is the same expression with the sign the other way up, exactly
+    # as Cohesion is for noodle-on-noodle: inside the gap the point is pushed
+    # out, just outside it is pulled back in. Wet pasta clings to a chopstick,
+    # and the distance this needs has already been measured.
+    #
+    # The pull is capped at a fraction of a segment; the push deliberately is
+    # not, because a buried point has to come out however deep it is. An
+    # uncapped pull would snap a passing noodle onto the surface hard enough to
+    # become launch velocity when it let go.
+    stick_reach = math("ADD", collider_gap,
+                       math("MULTIPLY", diameter, COHESION_REACH - 1.0, 54, 8), 54, 9)
+    pull_cap = math("MULTIPLY", math("MULTIPLY", rest, PUSH_LIMIT, 54, 10), -1.0, 54, 11)
+
+    def collider_pass(solve, grid, stickiness, col, row):
+        """Push out of one field, cling to it, and report the distance."""
+        d_i, grad_i = sdf_probe(grid, position, col, row)
+        # Outside the narrow band the grid is a constant, so the gradient is
+        # exactly zero. That doubles as the "is there a collider at all" test:
+        # with none assigned the grid is empty, the gradient is zero, and both
+        # the push and the friction below multiply out to nothing.
+        in_band = math("GREATER_THAN", vmath("LENGTH", grad_i, None, col + 5, row + 2),
+                       voxel, col + 6, row + 2)
+        depth = math("SUBTRACT", collider_gap, d_i, col + 5, row)
+        push_side = math("LESS_THAN", d_i, collider_gap, col + 5, row + 1)
+        stick = math("MAXIMUM",
+                     math("MULTIPLY",
+                          math("MULTIPLY", depth, stickiness, col + 6, row + 3),
+                          math("MULTIPLY",
+                               math("LESS_THAN", d_i, stick_reach, col + 6, row + 4),
+                               math("SUBTRACT", 1.0, push_side, col + 7, row + 4),
+                               col + 7, row + 5), col + 8, row + 3),
+                     pull_cap, col + 8, row + 4)
+        clear = math("MULTIPLY",
+                     math("ADD", math("MULTIPLY", depth, push_side, col + 6, row),
+                          stick, col + 7, row), in_band, col + 8, row)
+        solve = set_position(
+            solve, vmath("ADD", position,
+                         vmath("SCALE", vmath("NORMALIZE", grad_i, None, col + 7, row + 2),
+                               clear, col + 8, row + 2), col + 9, row + 2), col + 10, 1)
+        # What the friction stage needs, taken from the probe already paid for.
+        # Parked far away outside the band, so points nowhere near a collider
+        # read as "not touching" rather than as "sitting on the surface".
+        gated = math("ADD", d_i,
+                     math("MULTIPLY", 1e9,
+                          math("SUBTRACT", 1.0, in_band, col + 6, row + 6),
+                          col + 7, row + 6), col + 8, row + 6)
+        return solve, gated
+
+    solve, d_plain = collider_pass(solve, grid, P["Collider Stickiness"], 55, 8)
+    solve, d_stick = collider_pass(solve, sticky_grid, P["Sticky Collider Grip"], 55, 16)
+    # Friction only cares which surface is nearest, not which set it came from.
+    solve = store(solve, ATTR_CDIST, math("MINIMUM", d_plain, d_stick, 66, 12),
+                  "FLOAT", 67, 12)
 
 
     plug(rep_out.inputs["Geometry"], solve)
