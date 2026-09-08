@@ -69,10 +69,63 @@ giveaway that it is half interpenetrated.
 So if you rebuild in metres, changing Gravity is not enough on its own; raise
 Substeps to about 24 and expect it to cost more. Thicker noodles are the cheap
 direction either way - fewer points, and more frames per segment fallen.
+
+Usage contract
+
+--------------
+Run inside Blender 5.2+ with ``blender --background --python noodle_physics.py``.
+Blender's arguments must follow ``--``; supported modes are ``--check``,
+``--bench [preset] [count] [frames]``, and ``--realtime [preset]``.
+The script intentionally has no external Python dependencies.
 """
 
 import sys
 from math import tau
+
+
+class CliError(ValueError):
+    """A user-facing command-line validation error."""
+
+
+def positive_int(value, label, minimum=1):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise CliError(f"{label} must be an integer, got {value!r}") from exc
+    if parsed < minimum:
+        raise CliError(f"{label} must be >= {minimum}, got {parsed}")
+    return parsed
+
+
+def require_preset(preset):
+    valid = ("default",) + tuple(REALTIME_PRESETS)
+    if preset not in valid:
+        raise CliError(f"unknown preset {preset!r}; choose from {', '.join(valid)}")
+    return preset
+
+
+def parse_mode_args(argv):
+    """Parse the small Blender-side CLI without hiding malformed input."""
+    if "--check" in argv:
+        return ("check",)
+    if "--bench" in argv:
+        i = argv.index("--bench") + 1
+        rest = argv[i:]
+        preset = require_preset(rest[0] if rest and not rest[0].startswith("-") else "default")
+        count = positive_int(rest[1], "count") if len(rest) > 1 else 120
+        frames = positive_int(rest[2], "frames") if len(rest) > 2 else 60
+        if len(rest) > 3:
+            raise CliError("--bench accepts at most preset, count, and frames")
+        return ("bench", preset, count, frames)
+    if "--realtime" in argv:
+        i = argv.index("--realtime") + 1
+        rest = argv[i:]
+        preset = require_preset(rest[0] if rest and not rest[0].startswith("-") else "balanced")
+        if len(rest) > 1:
+            raise CliError("--realtime accepts one preset")
+        return ("realtime", preset)
+    return ("build",)
+
 
 import bpy
 
@@ -112,6 +165,20 @@ COHESION_REACH = 1.8
 # Ceiling on one contact pass, as a fraction of a segment. Keeps a spawn-time
 # overlap from converting into launch velocity.
 PUSH_LIMIT = 0.25
+
+# Leave a little clearance under the one-segment displacement bound. The
+# strict bound is enough for static samples, but the margin prevents a point
+# landing exactly on the next sample from tunnelling after rounding and
+# makes the limit robust when a collider moves during a frame.
+VELOCITY_SAFETY = 0.85
+
+# Hard runtime ceilings keep a mistaken socket value from multiplying the
+# Geometry Nodes graph into an unusable frame. The exposed sockets remain wide
+# for experimentation, but values beyond these limits no longer create runaway
+# evaluation times or make the simulation appear frozen.
+MAX_RUNTIME_SUBSTEPS = 24
+MAX_RUNTIME_ITERATIONS = 12
+
 
 # Turn rate of the spawn coil. A noodle held upright would buckle instantly, so
 # it is spawned already coiled rather than as a rigid vertical rod.
@@ -179,10 +246,12 @@ DESCRIPTIONS = {
     "Substeps":
         "Times the frame is subdivided. This is what stops fast noodles "
         "tunnelling through each other, and it is the bulk of the cost. "
-        "Reduce Iterations before touching this",
+        "Reduce Iterations before touching this. Values above 24 are capped "
+        "to keep evaluation time predictable",
     "Iterations":
         "Constraint passes per substep. 2 is enough; below that the solve "
-        "falls apart, above it costs time for very little",
+        "falls apart, above it costs time for very little. Values above 12 "
+        "are capped to keep playback responsive",
     "Stiffness":
         "Bending resistance, 1 rigid and 0 a free chain. Solved as XPBD, so "
         "it does not drift much when Substeps or Iterations change",
@@ -536,11 +605,30 @@ def build_group():
     sub_in = nd("GeometryNodeRepeatInput", 20, 2)
     sub_out = nd("GeometryNodeRepeatOutput", 78, 1)
     sub_in.pair_with_output(sub_out)
-    plug(sub_in.inputs["Iterations"], P["Substeps"])
+    # Keep evaluation cost bounded even if the user dials the socket above the
+    # practical realtime range. Also avoid spending the full budget on easy
+    # frames: choose the smallest stable count from gravity, frame duration,
+    # and the measured point spacing. The user's value remains an upper bound,
+    # while the safety margin keeps the velocity clamp and timestep consistent.
+    requested_substeps = math("MINIMUM", P["Substeps"], MAX_RUNTIME_SUBSTEPS, 20, 3)
+    frame_dt_safe = math("MAXIMUM", frame_dt, 1e-6, 20, 4)
+    gravity_distance = math("MULTIPLY", math("ABSOLUTE", P["Gravity"], 20, 5),
+                            math("MULTIPLY", frame_dt_safe, frame_dt_safe, 20, 6),
+                            21, 5)
+    required_substeps = math(
+        "CEIL",
+        math("SQRT", math("DIVIDE", gravity_distance,
+                           math("MAXIMUM", math("MULTIPLY", diameter, VELOCITY_SAFETY, 21, 6),
+                                 1e-6, 21, 7), 22, 5), 22, 6),
+        22, 7)
+    runtime_substeps = math("MAXIMUM",
+                            math("MINIMUM", requested_substeps, required_substeps, 23, 3),
+                            1.0, 23, 4)
+    plug(sub_in.inputs["Iterations"], runtime_substeps)
     plug(sub_in.inputs["Geometry"], state)
     state = sub_in.outputs["Geometry"]
-    substeps = math("MAXIMUM", P["Substeps"], 1.0, 20, 4)
-    dt = math("DIVIDE", frame_dt, substeps, 21, 4)
+    substeps = math("MAXIMUM", runtime_substeps, 1.0, 20, 8)
+    dt = math("DIVIDE", frame_dt, substeps, 21, 8)
     # Per noodle, not global: Length Variation means every strand has its own
     # rest length, and the speed clamp and contact rules all key off it. Taken
     # from the actual resampled point count, so it stays exact after the
@@ -568,7 +656,9 @@ def build_group():
     # the cache. One segment per substep is also exactly the bound collision
     # sampling needs, so the guard and the accuracy limit are the same number.
     speed = vmath("LENGTH", velocity, None, 26, 3)
-    top_speed = math("DIVIDE", rest, math("MAXIMUM", dt, 1e-9, 26, 4), 27, 4)
+    top_speed = math("DIVIDE",
+                     math("MULTIPLY", rest, VELOCITY_SAFETY, 26, 4),
+                     math("MAXIMUM", dt, 1e-9, 26, 5), 27, 4)
     velocity = vmath("SCALE", velocity,
                      math("MINIMUM", math("DIVIDE", top_speed,
                                           math("MAXIMUM", speed, 1e-6, 27, 5), 28, 5), 1.0, 29, 5),
@@ -669,7 +759,11 @@ def build_group():
     rep_in = nd("GeometryNodeRepeatInput", 35, 1)
     rep_out = nd("GeometryNodeRepeatOutput", 39, 1)
     rep_in.pair_with_output(rep_out)
-    plug(rep_in.inputs["Iterations"], P["Iterations"])
+    # Constraint iterations are the other major runtime multiplier. A bounded
+    # effective value keeps playback responsive while retaining the editable
+    # socket for normal-quality tuning.
+    runtime_iterations = math("MINIMUM", P["Iterations"], MAX_RUNTIME_ITERATIONS, 35, 0)
+    plug(rep_in.inputs["Iterations"], runtime_iterations)
     plug(rep_in.inputs["Geometry"], state)
     solve = rep_in.outputs["Geometry"]
 
@@ -1042,9 +1136,20 @@ def build_object(ng):
 
 
 def set_input(obj, ng, name, value):
-    """Blender 5.x moved modifier inputs off ID properties onto this collection."""
-    identifier = next(s.identifier for s in ng.interface.items_tree if s.name == name)
-    getattr(obj.modifiers[0].properties.inputs, identifier).value = value
+    """Set a modifier input, with an actionable error for renamed sockets."""
+    socket = next((s for s in ng.interface.items_tree
+                   if getattr(s, "item_type", None) == "SOCKET" and s.name == name), None)
+    if socket is None:
+        available = [s.name for s in ng.interface.items_tree
+                     if getattr(s, "item_type", None) == "SOCKET"]
+        raise CliError(f"node-group socket {name!r} is missing; available: {available}")
+    identifier = socket.identifier
+    inputs = getattr(obj.modifiers[0].properties, "inputs", None)
+    target = getattr(inputs, identifier, None)
+    if target is None:
+        raise CliError(f"modifier input for socket {name!r} is unavailable")
+    target.value = value
+
     # Writing an Object or Collection socket this way does not rebuild the
     # modifier's dependency relations on its own, and without them Object Info
     # hands the solver an empty mesh - a collider assigned from a script simply
@@ -1066,12 +1171,19 @@ def bake(obj, frames, report=None):
     history = {}
     for frame in range(1, frames + 1):
         scene.frame_set(frame)
-        mesh = obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh()
-        zs = [v.co.z for v in mesh.vertices]
-        reach = max(max(abs(v.co.x), abs(v.co.y)) for v in mesh.vertices)
-        history[frame] = (len(mesh.vertices), min(zs), max(zs), reach)
-        if report and frame in report:
-            print(f"  frame {frame:4}  z {min(zs):8.1f} .. {max(zs):8.1f}  reach {reach:7.1f}")
+        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        mesh = evaluated.to_mesh()
+        try:
+            if not mesh.vertices:
+                raise RuntimeError(f"frame {frame} produced no evaluated vertices")
+            zs = [v.co.z for v in mesh.vertices]
+            reach = max(max(abs(v.co.x), abs(v.co.y)) for v in mesh.vertices)
+            history[frame] = (len(mesh.vertices), min(zs), max(zs), reach)
+            if report and frame in report:
+                print(f"  frame {frame:4}  z {min(zs):8.1f} .. {max(zs):8.1f}  reach {reach:7.1f}")
+        finally:
+            evaluated.to_mesh_clear()
+
     return history
 
 
@@ -1123,7 +1235,11 @@ REALTIME_PRESETS = {
 
 def apply_realtime(obj, ng, preset="balanced"):
     """Push a measured realtime preset onto an already-built noodle object."""
+    preset = require_preset(preset)
+    if preset == "default":
+        return obj
     overrides, _ = REALTIME_PRESETS[preset]
+
     for name, value in overrides.items():
         set_input(obj, ng, name, value)
     return obj
@@ -1151,10 +1267,17 @@ def bench(preset="default", count=120, frames=90):
     for f in range(1, frames + 1):
         t = time.perf_counter()
         scene.frame_set(f)
-        mesh = obj.evaluated_get(dg()).to_mesh()
-        zs = [v.co.z for v in mesh.vertices]
-        times.append((time.perf_counter() - t) * 1000.0)
-        tops.append(max(zs))
+        evaluated = obj.evaluated_get(dg())
+        mesh = evaluated.to_mesh()
+        try:
+            if not mesh.vertices:
+                raise RuntimeError(f"frame {f} produced no evaluated vertices")
+            zs = [v.co.z for v in mesh.vertices]
+            times.append((time.perf_counter() - t) * 1000.0)
+            tops.append(max(zs))
+        finally:
+            evaluated.to_mesh_clear()
+
 
     steady = sorted(times[5:] if len(times) > 6 else times)
     mean = sum(steady) / len(steady)
@@ -1208,26 +1331,19 @@ def self_check():
 
 def main():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-    if "--check" in argv:
+    mode = parse_mode_args(argv)
+    if mode[0] == "check":
         self_check()
         return
-    if "--bench" in argv:
-        # --bench [preset] [count] [frames]; positionals after the flag.
-        rest = argv[argv.index("--bench") + 1:]
-        preset = rest[0] if len(rest) > 0 else "default"
-        count = int(rest[1]) if len(rest) > 1 else 120
-        frames = int(rest[2]) if len(rest) > 2 else 60
+    if mode[0] == "bench":
+        _, preset, count, frames = mode
         bench(preset, count, frames)
         return
 
     ng = build_group()
     obj = build_object(ng)
-    # --realtime [preset]: apply a measured fast preset for live playback. See
-    # REALTIME_PRESETS. 'balanced' keeps 120 noodles at ~16 fps; 'fast' reaches
-    # ~21 fps at 120 or ~30 fps at 60, at the cost of some interpenetration.
-    if "--realtime" in argv:
-        rest = argv[argv.index("--realtime") + 1:]
-        preset = rest[0] if rest and not rest[0].startswith("-") else "balanced"
+    if mode[0] == "realtime":
+        _, preset = mode
         apply_realtime(obj, ng, preset)
         _, maxn = REALTIME_PRESETS[preset]
         print(f"Built '{NG_NAME}' with realtime preset '{preset}'. "
@@ -1237,5 +1353,10 @@ def main():
     print(f"Built '{NG_NAME}' on object '{OBJ_NAME}'. Play the timeline from frame 1.")
 
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CliError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
