@@ -605,25 +605,23 @@ def build_group():
     sub_in = nd("GeometryNodeRepeatInput", 20, 2)
     sub_out = nd("GeometryNodeRepeatOutput", 78, 1)
     sub_in.pair_with_output(sub_out)
-    # Keep evaluation cost bounded even if the user dials the socket above the
-    # practical realtime range. Also avoid spending the full budget on easy
-    # frames: choose the smallest stable count from gravity, frame duration,
-    # and the measured point spacing. The user's value remains an upper bound,
-    # while the safety margin keeps the velocity clamp and timestep consistent.
-    requested_substeps = math("MINIMUM", P["Substeps"], MAX_RUNTIME_SUBSTEPS, 20, 3)
-    frame_dt_safe = math("MAXIMUM", frame_dt, 1e-6, 20, 4)
-    gravity_distance = math("MULTIPLY", math("ABSOLUTE", P["Gravity"], 20, 5),
-                            math("MULTIPLY", frame_dt_safe, frame_dt_safe, 20, 6),
-                            21, 5)
-    required_substeps = math(
-        "CEIL",
-        math("SQRT", math("DIVIDE", gravity_distance,
-                           math("MAXIMUM", math("MULTIPLY", diameter, VELOCITY_SAFETY, 21, 6),
-                                 1e-6, 21, 7), 22, 5), 22, 6),
-        22, 7)
-    runtime_substeps = math("MAXIMUM",
-                            math("MINIMUM", requested_substeps, required_substeps, 23, 3),
-                            1.0, 23, 4)
+    # The socket is the count. It also sets the fall-speed cap, because the
+    # clamp below is rest/dt and dt is the frame divided by this number - so
+    # lowering it without raising Noodle Radius puts the sim in slow motion
+    # rather than speeding it up. Only the runtime ceiling is applied here.
+    #
+    # A previous version derived this from gravity and frame_dt instead, to
+    # avoid spending the full budget on easy frames. That quantity is the
+    # distance fallen in one frame *from rest*, which is not what the clamp
+    # bounds: the clamp bounds the displacement actually achieved. On the
+    # default scene it evaluated to 386 * (1/24)^2 / (5 * 0.85) = 0.158, whose
+    # square root is 0.397, so CEIL returned 1 on every frame at 24 fps.
+    # Substeps stopped changing fall speed at all - 8 and 24 measured
+    # bit-identical, both 4.301 units a frame - and the default preset ran
+    # 9.4x slow. Deriving the count from the achieved speed is the only form
+    # that works, and the clamp below already bounds that to one segment per
+    # substep, so the budget cannot run away.
+    runtime_substeps = math("MINIMUM", P["Substeps"], MAX_RUNTIME_SUBSTEPS, 20, 3)
     plug(sub_in.inputs["Iterations"], runtime_substeps)
     plug(sub_in.inputs["Geometry"], state)
     state = sub_in.outputs["Geometry"]
