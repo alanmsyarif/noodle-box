@@ -1,0 +1,6 @@
+# Keep one line ending in the repository regardless of core.autocrlf.
+# Without this, the blobs flip between CRLF and LF depending on which machine
+# last wrote the file, and every real change arrives as a whole-file diff.
+* text=auto eol=lf
+*.pyc binary
+*.blend binary

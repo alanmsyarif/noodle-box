@@ -1,0 +1,10 @@
+# Local worktrees and agent scratch
+.worktrees/
+.hermes/
+
+# Test environment
+.venv-test/
+
+# Blender / Python bytecode
+__pycache__/
+*.py[cod]

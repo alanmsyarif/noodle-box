@@ -1,13 +1,15 @@
 """Simulated noodle pile for Blender 5.2 - geometry nodes, real physics.
 
-The middle ground between the two other scripts in this repo:
+Two cheaper approaches exist for the same picture, and this file is the one that
+gives up neither of them:
 
-  noodles3.py      rigid-body sim, 275 x 100 cylinders, minutes to bake,
-                   dead geometry afterwards
-  noodle_nodes.py  procedural curves, instant, but noodles interpenetrate
-  this file        a position-based-dynamics rope solver written in geometry
-                   nodes: noodles fall, buckle, collide with each other and
-                   heap up, and every parameter stays editable
+  rigid-body sim    a cylinder per segment, minutes to bake, and the geometry is
+                    dead afterwards - the simulation cannot be re-tuned
+  procedural curves instant, but the noodles interpenetrate: they are a shape,
+                    not a pile
+  this file         a position-based-dynamics rope solver written in geometry
+                    nodes: noodles fall, buckle, collide with each other and
+                    heap up, and every parameter stays editable
 
 Solver, inside a Simulation Zone, run Substeps times per frame:
 
@@ -75,7 +77,14 @@ Usage contract
 --------------
 Run inside Blender 5.2+ with ``blender --background --python noodle_physics.py``.
 Blender's arguments must follow ``--``; supported modes are ``--check``,
-``--bench [preset] [count] [frames]``, and ``--realtime [preset]``.
+``--bench [preset] [count] [frames]``, and ``--realtime [preset]``. With no
+arguments at all - which is what the Scripting workspace's Run Script button
+does - the PRESET constant near the top of this file decides the scene.
+
+A CLI error prints one line and exits 2. Note that Blender exits 0 on an
+unhandled exception, so an exit code alone is not a pass/fail signal for this
+script; tests/ drives the solver in-process instead, where exceptions raise.
+
 The script intentionally has no external Python dependencies.
 """
 
@@ -98,9 +107,10 @@ def positive_int(value, label, minimum=1):
 
 
 def require_preset(preset):
-    valid = ("default",) + tuple(REALTIME_PRESETS)
-    if preset not in valid:
-        raise CliError(f"unknown preset {preset!r}; choose from {', '.join(valid)}")
+    """Validate a preset name against the tables, which are the single source."""
+    if preset not in preset_names():
+        raise CliError(f"unknown preset {preset!r}; choose from "
+                       f"{', '.join(preset_names())}")
     return preset
 
 
@@ -132,6 +142,29 @@ import bpy
 NG_NAME = "Noodle Physics"
 OBJ_NAME = "NoodlePhysics"
 MAT_NAME = "Noodle"
+
+# Preset applied when the script is run with no arguments - which is what the
+# Scripting workspace's Run Script does, and is the usual way this file is used.
+# None gives the reference-quality defaults in PARAMS.
+#
+# Speed presets (keep the file's inch-flavoured units, ~25 m noodles):
+#   None            8 substeps, r2.5    reference quality
+#   "quality"       4 substeps, r5.0    cheaper to settle, chunkier pasta
+#   "balanced"      3 substeps, r7.0
+#   "fast"          2 substeps, r9.0    blocky, but the one to scrub with
+#
+# Unit presets (metres, real gravity, object scale stays 1.0):
+#   "metric"        0.5 m noodles, 16 mm thick   general-purpose metric scene
+#   "metric_fast"   0.5 m noodles, 24 mm thick   cheap enough to scrub
+#
+# Use a metric preset if you have been scaling the object down to see it: that
+# workaround shrinks the picture but not the physics, so the fall reads about 3x
+# too slow. See the note above UNIT_PRESETS.
+#
+# Edit this line rather than the sliders: the settings interact, and lowering
+# Substeps without raising Noodle Radius puts the sim in slow motion instead of
+# speeding it up. See the note above REALTIME_PRESETS for why.
+PRESET = None
 
 ATTR_ID = "np_id"      # per-noodle identity
 ATTR_VEL = "np_vel"    # carried between frames inside the simulation state
@@ -178,6 +211,14 @@ VELOCITY_SAFETY = 0.85
 # evaluation times or make the simulation appear frozen.
 MAX_RUNTIME_SUBSTEPS = 24
 MAX_RUNTIME_ITERATIONS = 12
+
+# How far above its spawn height the pile top may rise before --check calls it
+# a launch. A coiled noodle uncoils as it falls and lifts the top a little even
+# when the solver is healthy, so this is a ceiling on the failure rather than a
+# promise of no rise. It is set above the 1.30x this scene measures today and
+# below the 1.70x it measured before the substep count was fixed, so it fails on
+# the behaviour it is there to catch.
+LAUNCH_LIMIT = 1.5
 
 
 # Turn rate of the spawn coil. A noodle held upright would buckle instantly, so
@@ -237,17 +278,67 @@ PARAMS = [
 
 
 DESCRIPTIONS = {
+    "Noodle Count":
+        "How many strands to drop. Cost is linear in this, and it is the "
+        "cheapest way to make a scene affordable: halving the count halves the "
+        "frame. The presets quote a suggested maximum in the console line they "
+        "print when they build",
+    "Seed":
+        "Changes where every noodle spawns and how long it is, without touching "
+        "anything else. Two scenes that differ only in Seed are the same "
+        "experiment run twice, which is what makes it useful for checking that "
+        "a result is the solver and not the layout",
+    "Noodle Length":
+        "Rest length of a strand, before Length Variation spreads it. The point "
+        "count is derived from this, so doubling it doubles the cost. It is the "
+        "one dimension not to shrink on its own: the solver's accuracy is set "
+        "by how far a point falls per frame measured in segments, so a shorter "
+        "noodle falls more segments per frame and needs more Substeps",
+    "Profile Faces":
+        "Sides on the tube. Six reads as round at a distance and is the "
+        "cheapest; this only affects the surface, never the solve, so it is "
+        "free to lower for a preview and raise for a render",
+    "Fill Diameter":
+        "Diameter of the disc the noodles are dropped onto. It sets how wide "
+        "the pile starts, not how wide it ends up - a pile spreads to roughly "
+        "its own size as it settles",
+    "Start Height":
+        "How far above the floor the noodles spawn. Higher means more fall "
+        "before the first contact, so more speed to resolve; it is also what "
+        "sets the terminal velocity the substep count has to cover, which is "
+        "what substeps_for() reads",
+    "Gravity":
+        "Downward acceleration, in the scene's units per second squared. The "
+        "defaults are inches, so 386 is real gravity for a 25 m noodle - not "
+        "9.81. What makes a solve hard is gravity measured in segment lengths, "
+        "so changing this without changing Substeps does not preserve the "
+        "motion: see the Scale and gravity note at the top of the file",
+    "Damping":
+        "Per-frame air drag, applied as this substep's share of it so raising "
+        "Substeps does not thicken the air. Small values are what stop a pile "
+        "jittering forever; large ones make the noodles fall like they are in "
+        "syrup",
+    "Friction":
+        "Noodle-on-noodle friction, applied to velocity at contact rather than "
+        "to position. This is what stops a pile flowing sideways, and it is "
+        "the knob to reach for when a heap spreads out instead of building up",
     "Noodle Radius":
         "Half the noodle thickness. Also the performance dial, twice over: the "
         "point count is derived from it, and thicker noodles fall fewer "
-        "segment-lengths per frame so they tolerate fewer Substeps. 2.5 gives "
-        "201 points per noodle and about 76 ms a frame at 120 noodles; 4.0 "
-        "gives 126 points and about 54 ms, and collides slightly better",
+        "segment-lengths per frame so they tolerate fewer Substeps. It is the "
+        "radius that has to move whenever Substeps does - halving one and "
+        "leaving the other alone is what puts the sim in slow motion. Measured "
+        "at 120 noodles on the default scene, r2.5 with 8 substeps costs about "
+        "380 ms a frame; r5.0 with 4 substeps costs about 143 ms and settles in "
+        "the same number of frames, and it collides slightly better too",
     "Substeps":
         "Times the frame is subdivided. This is what stops fast noodles "
-        "tunnelling through each other, and it is the bulk of the cost. "
-        "Reduce Iterations before touching this. Values above 24 are capped "
-        "to keep evaluation time predictable",
+        "tunnelling through each other, and it is the bulk of the cost. It is "
+        "also half of what sets the fall speed, because the velocity clamp is "
+        "one segment per substep - so lowering this without raising Noodle "
+        "Radius makes the sim slower to watch, not faster to run. Raise it "
+        "first when tunnelling appears; reduce Iterations before touching it. "
+        "Values above 24 are capped to keep evaluation time predictable",
     "Iterations":
         "Constraint passes per substep. 2 is enough; below that the solve "
         "falls apart, above it costs time for very little. Values above 12 "
@@ -301,7 +392,7 @@ DESCRIPTIONS = {
 
 
 def ensure_material():
-    """Shared with noodle_nodes.py by name, so both scripts land on one material.
+    """One shared noodle material, reused if it already exists.
 
     Every strand is shaded slightly differently, driven by the np_id attribute
     the solver leaves on the mesh. Uniform pasta reads as plastic: real cooked
@@ -605,25 +696,23 @@ def build_group():
     sub_in = nd("GeometryNodeRepeatInput", 20, 2)
     sub_out = nd("GeometryNodeRepeatOutput", 78, 1)
     sub_in.pair_with_output(sub_out)
-    # Keep evaluation cost bounded even if the user dials the socket above the
-    # practical realtime range. Also avoid spending the full budget on easy
-    # frames: choose the smallest stable count from gravity, frame duration,
-    # and the measured point spacing. The user's value remains an upper bound,
-    # while the safety margin keeps the velocity clamp and timestep consistent.
-    requested_substeps = math("MINIMUM", P["Substeps"], MAX_RUNTIME_SUBSTEPS, 20, 3)
-    frame_dt_safe = math("MAXIMUM", frame_dt, 1e-6, 20, 4)
-    gravity_distance = math("MULTIPLY", math("ABSOLUTE", P["Gravity"], 20, 5),
-                            math("MULTIPLY", frame_dt_safe, frame_dt_safe, 20, 6),
-                            21, 5)
-    required_substeps = math(
-        "CEIL",
-        math("SQRT", math("DIVIDE", gravity_distance,
-                           math("MAXIMUM", math("MULTIPLY", diameter, VELOCITY_SAFETY, 21, 6),
-                                 1e-6, 21, 7), 22, 5), 22, 6),
-        22, 7)
-    runtime_substeps = math("MAXIMUM",
-                            math("MINIMUM", requested_substeps, required_substeps, 23, 3),
-                            1.0, 23, 4)
+    # The socket is the count. It also sets the fall-speed cap, because the
+    # clamp below is rest/dt and dt is the frame divided by this number - so
+    # lowering it without raising Noodle Radius puts the sim in slow motion
+    # rather than speeding it up. Only the runtime ceiling is applied here.
+    #
+    # A previous version derived this from gravity and frame_dt instead, to
+    # avoid spending the full budget on easy frames. That quantity is the
+    # distance fallen in one frame *from rest*, which is not what the clamp
+    # bounds: the clamp bounds the displacement actually achieved. On the
+    # default scene it evaluated to 386 * (1/24)^2 / (5 * 0.85) = 0.158, whose
+    # square root is 0.397, so CEIL returned 1 on every frame at 24 fps.
+    # Substeps stopped changing fall speed at all - 8 and 24 measured
+    # bit-identical, both 4.301 units a frame - and the default preset ran
+    # 9.4x slow. Deriving the count from the achieved speed is the only form
+    # that works, and the clamp below already bounds that to one segment per
+    # substep, so the budget cannot run away.
+    runtime_substeps = math("MINIMUM", P["Substeps"], MAX_RUNTIME_SUBSTEPS, 20, 3)
     plug(sub_in.inputs["Iterations"], runtime_substeps)
     plug(sub_in.inputs["Geometry"], state)
     state = sub_in.outputs["Geometry"]
@@ -1194,36 +1283,54 @@ def bake(obj, frames, report=None):
 # second one alone produces a simulation that is cheaper per frame and slower
 # to watch - which is worse than doing nothing.
 #
-# The reason is the velocity clamp: top_speed = rest/dt, and rest is the point
-# spacing, which is the diameter. So
+# The reason is the velocity clamp: top_speed = rest * VELOCITY_SAFETY / dt, and
+# rest is the point spacing, which is the diameter. So, with fps the frame rate,
 #
-#     fall speed cap = 2 * radius * substeps * fps
+#     fall speed cap = 2 * radius * VELOCITY_SAFETY * substeps * fps
 #     cost           ~ substeps * points  ~  substeps / radius
 #
 # Fall speed is proportional to radius*substeps; cost is proportional to
 # substeps/radius. Hold the speed fixed and cost goes as substeps^2 - so the
 # fast direction is FEWER substeps with proportionally FATTER noodles, and
 # cutting substeps without raising the radius just puts the sim in slow motion.
-# The default caps at 2*2.5*8*24 = 960 units/s; every preset here matches it.
+# The default caps at 2*2.5*0.85*8*24 = 816 units/s; every preset here lands
+# within 15% of that budget. tests/test_cli.py asserts the budget is held and
+# tests/test_fall_speed.py asserts the formula itself, because both of these
+# have been wrong in this file before.
 #
-# Measured, 120 noodles, via `--bench <preset> 120 110` on one machine. The
-# ms/frame here includes a full vertex readback the bench needs for the settle
+# `substeps_for()` below is how to pick the number for a new scene: it is the
+# smallest count whose clamp still lets the scene fall at the speed free fall
+# would reach from its own Start Height.
+#
+# Measured, 120 noodles, `--bench <preset> 120 110`, Windows 11 / Blender 5.2.0
+# LTS. ms/frame includes a full vertex readback the bench needs for the settle
 # metric and normal playback does not pay, so treat the ratios as the signal,
-# not the absolute fps:
+# not the absolute fps. Frames-to-settle is the portable column - it is the same
+# on any machine - and it is the one to compare against after a solver change:
 #
 #   preset    settings      ms/frame   frames   settle    vs default
-#   default   8 sub, r2.5      748       86     64.3 s      1.00x
-#   quality   4 sub, r5.0      328       94     30.9 s      2.08x
-#   balanced  3 sub, r7.0      349      103     36.0 s      1.79x
-#   fast      2 sub, r9.0       59       98      5.7 s     11.20x
+#   default   8 sub, r2.5      379       87     33.0 s      1.00x
+#   quality   4 sub, r5.0      143       97     13.9 s      2.64x
+#   balanced  3 sub, r7.0      109       99     10.8 s      3.47x
+#   fast      2 sub, r9.0       62      100      6.2 s      6.11x
 #
-# The scaling is not linear in substeps/radius - 'fast' is far cheaper than the
-# ratio predicts, and 'balanced' lands level with 'quality' rather than ahead of
+# These absolute ms numbers move by ~2x between machines and Blender builds; the
+# frame counts do not. Re-run the bench rather than trusting either.
+#
+# The scaling is not linear in substeps/radius: 'fast' is cheaper than the ratio
+# predicts and 'balanced' beats 'quality' by 1.3x rather than landing level with
 # it. The nearest-neighbour query dominates and its cost falls off a cliff once
 # the point count drops far enough, so measure rather than interpolate when
-# adding a preset.
+# adding a preset. An earlier version of this table claimed 'balanced' was level
+# with 'quality' and that 'fast' was 11x cheaper; on the same machine today it
+# is 1.3x and 2.3x. Re-run the bench.
 REALTIME_PRESETS = {
     # name: (overrides dict, suggested max noodle count for the fps quoted)
+    # "default" is the reference scene already in PARAMS, so it overrides
+    # nothing. It is a real entry rather than a special case so that the list
+    # of names cannot drift from the table - the old early-return version
+    # advertised this name in the README and then raised KeyError on it.
+    "default":  ({}, 120),
     "quality":  ({"Substeps": 4, "Iterations": 2, "Noodle Radius": 5.0,
                   "Profile Faces": 5}, 120),
     "balanced": ({"Substeps": 3, "Iterations": 2, "Noodle Radius": 7.0,
@@ -1233,13 +1340,83 @@ REALTIME_PRESETS = {
 }
 
 
-def apply_realtime(obj, ng, preset="balanced"):
-    """Push a measured realtime preset onto an already-built noodle object."""
-    preset = require_preset(preset)
-    if preset == "default":
-        return obj
-    overrides, _ = REALTIME_PRESETS[preset]
+def substeps_for(radius, gravity, start_height, fps=24.0, headroom=1.0):
+    """Fewest substeps whose velocity clamp still allows a full-speed fall.
 
+    The clamp is top_speed = rest * VELOCITY_SAFETY / dt, which per frame is
+    2 * radius * VELOCITY_SAFETY * substeps * fps, and free fall from
+    `start_height` reaches sqrt(2*g*h). Ask for fewer substeps than this and the
+    clamp bites every frame: the sim does not get faster, it goes into slow
+    motion, which is the one failure mode that looks like a performance win in a
+    ms-per-frame benchmark.
+
+    Rounded rather than ceiled, because the file's own defaults sit fractionally
+    under the bound. Raise `headroom` above 1.0 to insist on the full unclamped
+    speed.
+    """
+    reach = (2.0 * gravity * max(start_height, 0.0)) ** 0.5
+    need = headroom * reach / (2.0 * max(radius, 1e-9) * VELOCITY_SAFETY * fps)
+    return max(1, int(round(need)))
+
+
+# Unit presets. The defaults in PARAMS are inches - a noodle 1000 units long is
+# 25 m, and gravity 386 in/s2 IS real gravity, so the timing is already correct
+# for a 25 m noodle. Shrinking that with object scale does not shrink the
+# physics with it: the solve still takes as long as a 25 m fall, so a scene
+# scaled to 0.003 reads about 3x slower than reality. Rebuilding at the size you
+# actually want is the fix, and it is safe - the solver is scale-invariant to
+# within 0.5% over a 333x change in unit size (measured, both pile height and
+# reach normalised by noodle length).
+#
+# Real 2 mm spaghetti at 9.81 is genuinely expensive: it falls a segment every
+# half frame, so the clamp above wants ~50 substeps. Thick noodles are the way
+# out, exactly as they were for the realtime presets - fewer points AND fewer
+# substeps. These are udon rather than spaghetti, which is the honest cost.
+_METRIC = dict(length=0.5, start=0.35, fill=0.2, gravity=9.81)
+
+UNIT_PRESETS = {
+    # ~16 mm thick, 31 points a noodle. The general-purpose metric scene.
+    "metric": ({"Noodle Length": _METRIC["length"],
+                "Noodle Radius": 0.008,
+                "Start Height": _METRIC["start"],
+                "Fill Diameter": _METRIC["fill"],
+                "Gravity": _METRIC["gravity"],
+                "Substeps": substeps_for(0.008, _METRIC["gravity"], _METRIC["start"]),
+                "Iterations": 2,
+                "Profile Faces": 5}, 120),
+    # ~24 mm thick, 21 points a noodle. Chunkier, but cheap enough to scrub.
+    "metric_fast": ({"Noodle Length": _METRIC["length"],
+                     "Noodle Radius": 0.012,
+                     "Start Height": _METRIC["start"],
+                     "Fill Diameter": _METRIC["fill"],
+                     "Gravity": _METRIC["gravity"],
+                     "Substeps": substeps_for(0.012, _METRIC["gravity"], _METRIC["start"]),
+                     "Iterations": 2,
+                     "Profile Faces": 4}, 120),
+}
+
+
+def preset_names():
+    """Every name the CLI and the README may offer, derived from the tables."""
+    return tuple(REALTIME_PRESETS) + tuple(UNIT_PRESETS)
+
+
+def lookup_preset(name):
+    """Resolve one preset name to its (overrides, suggested max count)."""
+    for table in (REALTIME_PRESETS, UNIT_PRESETS):
+        if name in table:
+            return table[name]
+    raise CliError(f"unknown preset {name!r}; choose from "
+                   f"{', '.join(preset_names())}")
+
+
+def apply_realtime(obj, ng, preset="balanced"):
+    """Push a preset onto an already-built noodle object.
+
+    'default' resolves to an empty override set, so it is a no-op rather than
+    a branch. Returns obj for chaining.
+    """
+    overrides, _ = lookup_preset(preset)
     for name, value in overrides.items():
         set_input(obj, ng, name, value)
     return obj
@@ -1257,7 +1434,7 @@ def bench(preset="default", count=120, frames=90):
     ng = build_group()
     obj = build_object(ng)
     set_input(obj, ng, "Noodle Count", count)
-    if preset in REALTIME_PRESETS:
+    if preset and preset != "default":
         apply_realtime(obj, ng, preset)
 
     scene = bpy.context.scene
@@ -1312,20 +1489,37 @@ def self_check():
     set_input(obj, ng, "Noodle Radius", radius)
     set_input(obj, ng, "Start Height", start)
 
-    history = bake(obj, 120, report={1, 40, 80, 120})
-    verts, low, high, reach = history[120]
-    _, _, top_first, _ = history[1]
+    frames = 120
+    history = bake(obj, frames, report={1, 40, 80, frames})
+    verts, low, high, reach = history[frames]
+    top_first = history[1][2]
+    peak = max(history[f][2] for f in range(1, frames + 1))
+    peak_frame = max(range(1, frames + 1), key=lambda f: history[f][2])
 
     assert low == low and high == high, "solver produced NaN - it blew up"
     assert low > -1.5 * radius, f"noodles sank through the floor: {low:.4f}"
-    # The whole point of the exercise: they must have actually fallen.
-    assert high < top_first - length / 2, f"nothing fell: {top_first:.4f} -> {high:.4f}"
+    # The whole point of the exercise: they must have actually fallen. Stated
+    # as a fraction of the spawn height rather than as "half a noodle", which
+    # is what this used to say: that bound sat within 7 units of the height a
+    # healthy pile actually settles at, so the check failed on a solver that
+    # was working. A pile that has not moved still fails here by a mile.
+    assert high < top_first * 0.5, f"nothing fell: {top_first:.4f} -> {high:.4f}"
+    # Energy injection. Constraint passes move points directly, so a spawn-time
+    # overlap resolved over a frame arrives at the velocity readback as motion
+    # that was never a legal speed, and the pile rises above where it spawned.
+    # A healthy run still rises a little (the coiled spawn uncoils), so this is
+    # a ceiling on the failure, not a promise of no rise: measured 1.30x on
+    # this scene against 1.70x before the substep count was fixed.
+    assert peak < top_first * LAUNCH_LIMIT, (
+        f"pile launched: top {peak:.1f} at frame {peak_frame} against a spawn "
+        f"height of {top_first:.1f} ({peak / top_first:.2f}x)")
     # An unstable solver flings points to the horizon rather than settling. A
     # noodle landing straight already spans its own length, so allow for that.
     limit = fill / 2 + length * 1.5
     assert reach < limit, f"solver exploded sideways: reach {reach:.4f} > {limit:.4f}"
 
     print(f"OK  verts={verts}  top {top_first:.1f} -> {high:.1f}"
+          f"  peak {peak:.1f} ({peak / top_first:.2f}x at frame {peak_frame})"
           f"  floor {low:.2f}  reach {reach:.1f}")
 
 
@@ -1342,15 +1536,21 @@ def main():
 
     ng = build_group()
     obj = build_object(ng)
+    # --realtime [preset] on the command line, or the PRESET constant at the top
+    # of this file when there is no command line - which is the case for the
+    # Scripting workspace's Run Script button, and the usual way this is used.
+    preset = PRESET
     if mode[0] == "realtime":
         _, preset = mode
+    if preset:
         apply_realtime(obj, ng, preset)
-        _, maxn = REALTIME_PRESETS[preset]
-        print(f"Built '{NG_NAME}' with realtime preset '{preset}'. "
-              f"For the quoted fps keep Noodle Count near {maxn} or below. "
+        overrides, maxn = lookup_preset(preset)
+        print(f"Built '{NG_NAME}' with preset '{preset}': {overrides}. "
+              f"For the quoted speed keep Noodle Count near {maxn} or below. "
               f"Play the timeline from frame 1.")
         return
-    print(f"Built '{NG_NAME}' on object '{OBJ_NAME}'. Play the timeline from frame 1.")
+    print(f"Built '{NG_NAME}' on object '{OBJ_NAME}'. Play the timeline from "
+          f"frame 1. Slow? Set PRESET = \"fast\" at the top of this file.")
 
 
 
