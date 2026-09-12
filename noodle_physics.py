@@ -203,6 +203,14 @@ VELOCITY_SAFETY = 0.85
 MAX_RUNTIME_SUBSTEPS = 24
 MAX_RUNTIME_ITERATIONS = 12
 
+# How far above its spawn height the pile top may rise before --check calls it
+# a launch. A coiled noodle uncoils as it falls and lifts the top a little even
+# when the solver is healthy, so this is a ceiling on the failure rather than a
+# promise of no rise. It is set above the 1.30x this scene measures today and
+# below the 1.70x it measured before the substep count was fixed, so it fails on
+# the behaviour it is there to catch.
+LAUNCH_LIMIT = 1.5
+
 
 # Turn rate of the spawn coil. A noodle held upright would buckle instantly, so
 # it is spawned already coiled rather than as a rigid vertical rod.
@@ -1422,20 +1430,37 @@ def self_check():
     set_input(obj, ng, "Noodle Radius", radius)
     set_input(obj, ng, "Start Height", start)
 
-    history = bake(obj, 120, report={1, 40, 80, 120})
-    verts, low, high, reach = history[120]
-    _, _, top_first, _ = history[1]
+    frames = 120
+    history = bake(obj, frames, report={1, 40, 80, frames})
+    verts, low, high, reach = history[frames]
+    top_first = history[1][2]
+    peak = max(history[f][2] for f in range(1, frames + 1))
+    peak_frame = max(range(1, frames + 1), key=lambda f: history[f][2])
 
     assert low == low and high == high, "solver produced NaN - it blew up"
     assert low > -1.5 * radius, f"noodles sank through the floor: {low:.4f}"
-    # The whole point of the exercise: they must have actually fallen.
-    assert high < top_first - length / 2, f"nothing fell: {top_first:.4f} -> {high:.4f}"
+    # The whole point of the exercise: they must have actually fallen. Stated
+    # as a fraction of the spawn height rather than as "half a noodle", which
+    # is what this used to say: that bound sat within 7 units of the height a
+    # healthy pile actually settles at, so the check failed on a solver that
+    # was working. A pile that has not moved still fails here by a mile.
+    assert high < top_first * 0.5, f"nothing fell: {top_first:.4f} -> {high:.4f}"
+    # Energy injection. Constraint passes move points directly, so a spawn-time
+    # overlap resolved over a frame arrives at the velocity readback as motion
+    # that was never a legal speed, and the pile rises above where it spawned.
+    # A healthy run still rises a little (the coiled spawn uncoils), so this is
+    # a ceiling on the failure, not a promise of no rise: measured 1.30x on
+    # this scene against 1.70x before the substep count was fixed.
+    assert peak < top_first * LAUNCH_LIMIT, (
+        f"pile launched: top {peak:.1f} at frame {peak_frame} against a spawn "
+        f"height of {top_first:.1f} ({peak / top_first:.2f}x)")
     # An unstable solver flings points to the horizon rather than settling. A
     # noodle landing straight already spans its own length, so allow for that.
     limit = fill / 2 + length * 1.5
     assert reach < limit, f"solver exploded sideways: reach {reach:.4f} > {limit:.4f}"
 
     print(f"OK  verts={verts}  top {top_first:.1f} -> {high:.1f}"
+          f"  peak {peak:.1f} ({peak / top_first:.2f}x at frame {peak_frame})"
           f"  floor {low:.2f}  reach {reach:.1f}")
 
 
