@@ -1,13 +1,15 @@
 """Simulated noodle pile for Blender 5.2 - geometry nodes, real physics.
 
-The middle ground between the two other scripts in this repo:
+Two cheaper approaches exist for the same picture, and this file is the one that
+gives up neither of them:
 
-  noodles3.py      rigid-body sim, 275 x 100 cylinders, minutes to bake,
-                   dead geometry afterwards
-  noodle_nodes.py  procedural curves, instant, but noodles interpenetrate
-  this file        a position-based-dynamics rope solver written in geometry
-                   nodes: noodles fall, buckle, collide with each other and
-                   heap up, and every parameter stays editable
+  rigid-body sim    a cylinder per segment, minutes to bake, and the geometry is
+                    dead afterwards - the simulation cannot be re-tuned
+  procedural curves instant, but the noodles interpenetrate: they are a shape,
+                    not a pile
+  this file         a position-based-dynamics rope solver written in geometry
+                    nodes: noodles fall, buckle, collide with each other and
+                    heap up, and every parameter stays editable
 
 Solver, inside a Simulation Zone, run Substeps times per frame:
 
@@ -75,7 +77,14 @@ Usage contract
 --------------
 Run inside Blender 5.2+ with ``blender --background --python noodle_physics.py``.
 Blender's arguments must follow ``--``; supported modes are ``--check``,
-``--bench [preset] [count] [frames]``, and ``--realtime [preset]``.
+``--bench [preset] [count] [frames]``, and ``--realtime [preset]``. With no
+arguments at all - which is what the Scripting workspace's Run Script button
+does - the PRESET constant near the top of this file decides the scene.
+
+A CLI error prints one line and exits 2. Note that Blender exits 0 on an
+unhandled exception, so an exit code alone is not a pass/fail signal for this
+script; tests/ drives the solver in-process instead, where exceptions raise.
+
 The script intentionally has no external Python dependencies.
 """
 
@@ -269,17 +278,67 @@ PARAMS = [
 
 
 DESCRIPTIONS = {
+    "Noodle Count":
+        "How many strands to drop. Cost is linear in this, and it is the "
+        "cheapest way to make a scene affordable: halving the count halves the "
+        "frame. The presets quote a suggested maximum in the console line they "
+        "print when they build",
+    "Seed":
+        "Changes where every noodle spawns and how long it is, without touching "
+        "anything else. Two scenes that differ only in Seed are the same "
+        "experiment run twice, which is what makes it useful for checking that "
+        "a result is the solver and not the layout",
+    "Noodle Length":
+        "Rest length of a strand, before Length Variation spreads it. The point "
+        "count is derived from this, so doubling it doubles the cost. It is the "
+        "one dimension not to shrink on its own: the solver's accuracy is set "
+        "by how far a point falls per frame measured in segments, so a shorter "
+        "noodle falls more segments per frame and needs more Substeps",
+    "Profile Faces":
+        "Sides on the tube. Six reads as round at a distance and is the "
+        "cheapest; this only affects the surface, never the solve, so it is "
+        "free to lower for a preview and raise for a render",
+    "Fill Diameter":
+        "Diameter of the disc the noodles are dropped onto. It sets how wide "
+        "the pile starts, not how wide it ends up - a pile spreads to roughly "
+        "its own size as it settles",
+    "Start Height":
+        "How far above the floor the noodles spawn. Higher means more fall "
+        "before the first contact, so more speed to resolve; it is also what "
+        "sets the terminal velocity the substep count has to cover, which is "
+        "what substeps_for() reads",
+    "Gravity":
+        "Downward acceleration, in the scene's units per second squared. The "
+        "defaults are inches, so 386 is real gravity for a 25 m noodle - not "
+        "9.81. What makes a solve hard is gravity measured in segment lengths, "
+        "so changing this without changing Substeps does not preserve the "
+        "motion: see the Scale and gravity note at the top of the file",
+    "Damping":
+        "Per-frame air drag, applied as this substep's share of it so raising "
+        "Substeps does not thicken the air. Small values are what stop a pile "
+        "jittering forever; large ones make the noodles fall like they are in "
+        "syrup",
+    "Friction":
+        "Noodle-on-noodle friction, applied to velocity at contact rather than "
+        "to position. This is what stops a pile flowing sideways, and it is "
+        "the knob to reach for when a heap spreads out instead of building up",
     "Noodle Radius":
         "Half the noodle thickness. Also the performance dial, twice over: the "
         "point count is derived from it, and thicker noodles fall fewer "
-        "segment-lengths per frame so they tolerate fewer Substeps. 2.5 gives "
-        "201 points per noodle and about 76 ms a frame at 120 noodles; 4.0 "
-        "gives 126 points and about 54 ms, and collides slightly better",
+        "segment-lengths per frame so they tolerate fewer Substeps. It is the "
+        "radius that has to move whenever Substeps does - halving one and "
+        "leaving the other alone is what puts the sim in slow motion. Measured "
+        "at 120 noodles on the default scene, r2.5 with 8 substeps costs about "
+        "380 ms a frame; r5.0 with 4 substeps costs about 143 ms and settles in "
+        "the same number of frames, and it collides slightly better too",
     "Substeps":
         "Times the frame is subdivided. This is what stops fast noodles "
-        "tunnelling through each other, and it is the bulk of the cost. "
-        "Reduce Iterations before touching this. Values above 24 are capped "
-        "to keep evaluation time predictable",
+        "tunnelling through each other, and it is the bulk of the cost. It is "
+        "also half of what sets the fall speed, because the velocity clamp is "
+        "one segment per substep - so lowering this without raising Noodle "
+        "Radius makes the sim slower to watch, not faster to run. Raise it "
+        "first when tunnelling appears; reduce Iterations before touching it. "
+        "Values above 24 are capped to keep evaluation time predictable",
     "Iterations":
         "Constraint passes per substep. 2 is enough; below that the solve "
         "falls apart, above it costs time for very little. Values above 12 "
@@ -333,7 +392,7 @@ DESCRIPTIONS = {
 
 
 def ensure_material():
-    """Shared with noodle_nodes.py by name, so both scripts land on one material.
+    """One shared noodle material, reused if it already exists.
 
     Every strand is shaded slightly differently, driven by the np_id attribute
     the solver leaves on the mesh. Uniform pasta reads as plastic: real cooked
