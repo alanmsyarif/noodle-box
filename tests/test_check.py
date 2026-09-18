@@ -48,7 +48,8 @@ def test_pile_stays_above_the_floor(noodle):
     history = noodle.bake(obj, 60)
     low = history[60][1]
     assert low == low, "solver produced NaN"
-    assert low > -1.0, f"noodles sank through the floor: {low:.3f}"
+    radius = noodle.get_input(obj, ng, "Noodle Radius")
+    assert low > -0.25 * radius, f"noodles sank through the floor: {low:.6f}"
 
 
 def test_default_scene_does_not_launch(default_tops):

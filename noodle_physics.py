@@ -1,95 +1,26 @@
-"""Simulated noodle pile for Blender 5.2 - geometry nodes, real physics.
+"""Noodle Physics for Blender 5.2+.
 
-Two cheaper approaches exist for the same picture, and this file is the one that
-gives up neither of them:
+A position-based noodle solver built entirely in Geometry Nodes. Coordinates
+are metres, time is seconds, and gravity defaults to 9.81 m/s squared. Run this
+file in Blender, then open Viewport > Sidebar > Noodles. Existing objects are
+preserved; Add Noodles creates another independent simulation.
 
-  rigid-body sim    a cylinder per segment, minutes to bake, and the geometry is
-                    dead afterwards - the simulation cannot be re-tuned
-  procedural curves instant, but the noodles interpenetrate: they are a shape,
-                    not a pile
-  this file         a position-based-dynamics rope solver written in geometry
-                    nodes: noodles fall, buckle, collide with each other and
-                    heap up, and every parameter stays editable
+Point spacing is derived from each strand length and diameter. Each substep
+limits travel to 0.85 segments, then solves stretch, XPBD bending, nearest-point
+contact, cohesion, floor and signed-distance-field collider contact. Contact
+is approximate; this is a preview rope solver, not a continuous collision solver.
 
-Solver, inside a Simulation Zone, run Substeps times per frame:
+Adaptive substeps use the fastest stored point velocity plus this frame of
+gravity, bounded by the Substeps budget. Disable adaptation for fixed-step
+comparisons. The budget must still cover the intended fall speed; the sidebar
+can calculate it and warns when the runtime ceiling is insufficient.
 
-    remember previous position
-    v += gravity * dt ;  v *= this substep's share of damping
-    clamp |v| to one segment per substep
-    p += v * dt
-    find each point's nearest neighbour
-    repeat Iterations times:
-        pull consecutive points back to the rest segment length
-        straighten each corner toward its neighbours (bending stiffness)
-        push apart any pair closer than one noodle diameter, and pull
-            together any pair just past it (cohesion)
-        lift anything below the floor, then walk up the collider's
-            distance field until one radius clear of it
-    v = (p - previous p) / dt, then friction damps contacts sideways
-
-That second-to-last line is what makes it position-based: constraints move
-points directly, and velocity is read back out of the motion that actually
-happened, so nothing fights the solver.
-
-The one rule worth knowing: point spacing must *equal* the noodle diameter,
-and a point may never travel further than that in one step. Both are enforced
-rather than documented - the count is derived per noodle from its own length,
-and the frame is cut into Substeps - because breaking either makes noodles
-slide through each other in a way that looks like the solver is not running.
-Wider than a diameter and crossings fall between samples; narrower and a
-point's own chain neighbour always wins the nearest-neighbour query, so no
-contact is ever resolved. See the note at the resample for the measurements.
-
-That makes Noodle Radius the performance dial: thicker noodles need fewer
-points, so they simulate faster *and* collide slightly better. Blender 5.2's
-own XPBD Solver node is faster still, but it has no contact constraint - only
-EdgeLength, CrossEdgeLength, RodStretchShear, RodBendTwist, PinPosition and
-PinRotation - so it cannot make noodles rest on each other, which is the whole
-point of a pile.
-
-Usage
------
-In Blender:  Scripting workspace -> Open -> Run Script, then play the timeline.
-             The Simulation Zone caches as it plays; scrubbing backwards past
-             the cache restarts it. Frame 1 must be the first frame you play.
-Headless:    blender --background --python noodle_physics.py
-Self-check:  blender --background --python noodle_physics.py -- --check
-
-Scale and gravity
------------------
-The original scene's units, where a noodle is 5 units thick and 1000 long -
-inches, near enough. Gravity is therefore 386 (in/s2), not 9.81.
-
-This is deliberately not real-world scale, and the difference is not cosmetic.
-What decides how hard the solve is, is gravity measured in segment lengths: a
-noodle here falls one segment in about four frames, so the solver gets four
-passes to resolve every contact along the way. Real 2 mm spaghetti under 9.81
-falls a segment in half a frame and needs roughly three times the Substeps to
-reach the same result - at 8 it packs denser than solid pasta, which is the
-giveaway that it is half interpenetrated.
-
-So if you rebuild in metres, changing Gravity is not enough on its own; raise
-Substeps to about 24 and expect it to cost more. Thicker noodles are the cheap
-direction either way - fewer points, and more frames per segment fallen.
-
-Usage contract
-
---------------
-Run inside Blender 5.2+ with ``blender --background --python noodle_physics.py``.
-Blender's arguments must follow ``--``; supported modes are ``--check``,
-``--bench [preset] [count] [frames]``, and ``--realtime [preset]``. With no
-arguments at all - which is what the Scripting workspace's Run Script button
-does - the PRESET constant near the top of this file decides the scene.
-
-A CLI error prints one line and exits 2. Note that Blender exits 0 on an
-unhandled exception, so an exit code alone is not a pass/fail signal for this
-script; tests/ drives the solver in-process instead, where exceptions raise.
-
-The script intentionally has no external Python dependencies.
+CLI arguments follow Blender's -- separator. Use --python-exit-code 1 before
+--python to make exceptions fail headless jobs. No external packages required.
 """
 
 import sys
-from math import tau
+from math import ceil, isfinite, sqrt, tau
 
 
 class CliError(ValueError):
@@ -116,25 +47,27 @@ def require_preset(preset):
 
 def parse_mode_args(argv):
     """Parse the small Blender-side CLI without hiding malformed input."""
-    if "--check" in argv:
+    if not argv:
+        return ("build",)
+    if argv[0] == "--check" and len(argv) == 1:
         return ("check",)
-    if "--bench" in argv:
+    if argv[0] == "--bench":
         i = argv.index("--bench") + 1
         rest = argv[i:]
-        preset = require_preset(rest[0] if rest and not rest[0].startswith("-") else "default")
+        preset = require_preset(rest[0] if rest else "default")
         count = positive_int(rest[1], "count") if len(rest) > 1 else 120
         frames = positive_int(rest[2], "frames") if len(rest) > 2 else 60
         if len(rest) > 3:
             raise CliError("--bench accepts at most preset, count, and frames")
         return ("bench", preset, count, frames)
-    if "--realtime" in argv:
+    if argv[0] == "--realtime":
         i = argv.index("--realtime") + 1
         rest = argv[i:]
-        preset = require_preset(rest[0] if rest and not rest[0].startswith("-") else "balanced")
+        preset = require_preset(rest[0] if rest else "balanced")
         if len(rest) > 1:
             raise CliError("--realtime accepts one preset")
         return ("realtime", preset)
-    return ("build",)
+    raise CliError("expected --check, --bench [preset count frames], or --realtime [preset]")
 
 
 import bpy
@@ -143,28 +76,8 @@ NG_NAME = "Noodle Physics"
 OBJ_NAME = "NoodlePhysics"
 MAT_NAME = "Noodle"
 
-# Preset applied when the script is run with no arguments - which is what the
-# Scripting workspace's Run Script does, and is the usual way this file is used.
-# None gives the reference-quality defaults in PARAMS.
-#
-# Speed presets (keep the file's inch-flavoured units, ~25 m noodles):
-#   None            8 substeps, r2.5    reference quality
-#   "quality"       4 substeps, r5.0    cheaper to settle, chunkier pasta
-#   "balanced"      3 substeps, r7.0
-#   "fast"          2 substeps, r9.0    blocky, but the one to scrub with
-#
-# Unit presets (metres, real gravity, object scale stays 1.0):
-#   "metric"        0.5 m noodles, 16 mm thick   general-purpose metric scene
-#   "metric_fast"   0.5 m noodles, 24 mm thick   cheap enough to scrub
-#
-# Use a metric preset if you have been scaling the object down to see it: that
-# workaround shrinks the picture but not the physics, so the fall reads about 3x
-# too slow. See the note above UNIT_PRESETS.
-#
-# Edit this line rather than the sliders: the settings interact, and lowering
-# Substeps without raising Noodle Radius puts the sim in slow motion instead of
-# speeding it up. See the note above REALTIME_PRESETS for why.
-PRESET = None
+# Interactive startup preset. All presets use metres; None uses PARAMS.
+PRESET = "balanced"
 
 ATTR_ID = "np_id"      # per-noodle identity
 ATTR_VEL = "np_vel"    # carried between frames inside the simulation state
@@ -249,14 +162,14 @@ NOODLE_SPREAD = 51.7   # noise-space gap between noodles, for the start jitter
 
 # name, socket type, default, min, max, subtype
 PARAMS = [
-    ("Noodle Count",    "NodeSocketInt",   120,    1,     100000, None),
+    ("Noodle Count",    "NodeSocketInt",   48,     1,     100000, None),
     ("Seed",            "NodeSocketInt",   0,      0,     100000, None),
-    ("Noodle Length",   "NodeSocketFloat", 1000.0, 0.001, 1e6,    "DISTANCE"),
+    ("Noodle Length",   "NodeSocketFloat", 0.25,   0.001, 100.0,  "DISTANCE"),
     ("Length Variation","NodeSocketFloat", 0.15,   0.0,   0.9,    "FACTOR"),
     ("Spawn Coil",      "NodeSocketFloat", 1.0,    0.0,   1.0,    "FACTOR"),
-    ("Noodle Radius",   "NodeSocketFloat", 2.5,    0.001, 1e6,    "DISTANCE"),
+    ("Noodle Radius",   "NodeSocketFloat", 0.006,  0.0001, 10.0,  "DISTANCE"),
     ("Profile Faces",   "NodeSocketInt",   6,      3,     64,     None),
-    ("Fill Diameter",   "NodeSocketFloat", 400.0,  0.001, 1e6,    "DISTANCE"),
+    ("Fill Diameter",   "NodeSocketFloat", 0.2,    0.001, 100.0,  "DISTANCE"),
     # Object sockets carry no default or range, hence the Nones.
     ("Collider",        "NodeSocketObject", None,  None,  None,   None),
     ("Collider Collection", "NodeSocketCollection", None, None, None, None),
@@ -265,129 +178,57 @@ PARAMS = [
     ("Collider Stickiness","NodeSocketFloat", 0.0,  0.0,   1.0,    "FACTOR"),
     ("Sticky Collider", "NodeSocketCollection", None, None, None,   None),
     ("Sticky Collider Grip","NodeSocketFloat", 0.8,  0.0,   1.0,    "FACTOR"),
-    ("Start Height",    "NodeSocketFloat", 1250.0, 0.0,   1e6,    "DISTANCE"),
-    ("Gravity",         "NodeSocketFloat", 386.0,  0.0,   1e6,    None),
+    ("Start Height",    "NodeSocketFloat", 0.12,   0.0,   100.0,  "DISTANCE"),
+    ("Gravity",         "NodeSocketFloat", 9.81,   0.0,   1e6,    None),
     ("Damping",         "NodeSocketFloat", 0.03,   0.0,   1.0,    "FACTOR"),
     ("Stiffness",       "NodeSocketFloat", 0.5,    0.0,   1.0,    "FACTOR"),
-    ("Substeps",        "NodeSocketInt",   8,      1,     128,    None),
-    ("Iterations",      "NodeSocketInt",   2,      1,     64,     None),
+    ("Substeps",        "NodeSocketInt",   14,     1,     MAX_RUNTIME_SUBSTEPS, None),
+    ("Adaptive Substeps", "NodeSocketBool", True,  None,  None,   None),
+    ("Iterations",      "NodeSocketInt",   2,      1,     MAX_RUNTIME_ITERATIONS, None),
     ("Friction",        "NodeSocketFloat", 0.9,    0.0,   1.0,    "FACTOR"),
     ("Self Collision",  "NodeSocketFloat", 1.0,    0.0,   1.0,    "FACTOR"),
     ("Cohesion",        "NodeSocketFloat", 0.15,   0.0,   1.0,    "FACTOR"),
 ]
 
 
+# Shared ordering for the modifier and sidebar; collider details start folded.
+CONTROL_GROUPS = (
+    ("Noodles", False, ("Noodle Count", "Noodle Length", "Noodle Radius",
+                        "Length Variation", "Profile Faces")),
+    ("Spawn", False, ("Fill Diameter", "Start Height", "Spawn Coil", "Seed")),
+    ("Solver", False, ("Adaptive Substeps", "Substeps", "Iterations", "Gravity",
+                       "Damping", "Stiffness", "Self Collision", "Friction", "Cohesion")),
+    ("Colliders", True, ("Collider", "Collider Collection", "Collider Margin",
+                         "Collider Friction", "Collider Stickiness")),
+    ("Sticky colliders", True, ("Sticky Collider", "Sticky Collider Grip")),
+)
+
 DESCRIPTIONS = {
-    "Noodle Count":
-        "How many strands to drop. Cost is linear in this, and it is the "
-        "cheapest way to make a scene affordable: halving the count halves the "
-        "frame. The presets quote a suggested maximum in the console line they "
-        "print when they build",
-    "Seed":
-        "Changes where every noodle spawns and how long it is, without touching "
-        "anything else. Two scenes that differ only in Seed are the same "
-        "experiment run twice, which is what makes it useful for checking that "
-        "a result is the solver and not the layout",
-    "Noodle Length":
-        "Rest length of a strand, before Length Variation spreads it. The point "
-        "count is derived from this, so doubling it doubles the cost. It is the "
-        "one dimension not to shrink on its own: the solver's accuracy is set "
-        "by how far a point falls per frame measured in segments, so a shorter "
-        "noodle falls more segments per frame and needs more Substeps",
-    "Profile Faces":
-        "Sides on the tube. Six reads as round at a distance and is the "
-        "cheapest; this only affects the surface, never the solve, so it is "
-        "free to lower for a preview and raise for a render",
-    "Fill Diameter":
-        "Diameter of the disc the noodles are dropped onto. It sets how wide "
-        "the pile starts, not how wide it ends up - a pile spreads to roughly "
-        "its own size as it settles",
-    "Start Height":
-        "How far above the floor the noodles spawn. Higher means more fall "
-        "before the first contact, so more speed to resolve; it is also what "
-        "sets the terminal velocity the substep count has to cover, which is "
-        "what substeps_for() reads",
-    "Gravity":
-        "Downward acceleration, in the scene's units per second squared. The "
-        "defaults are inches, so 386 is real gravity for a 25 m noodle - not "
-        "9.81. What makes a solve hard is gravity measured in segment lengths, "
-        "so changing this without changing Substeps does not preserve the "
-        "motion: see the Scale and gravity note at the top of the file",
-    "Damping":
-        "Per-frame air drag, applied as this substep's share of it so raising "
-        "Substeps does not thicken the air. Small values are what stop a pile "
-        "jittering forever; large ones make the noodles fall like they are in "
-        "syrup",
-    "Friction":
-        "Noodle-on-noodle friction, applied to velocity at contact rather than "
-        "to position. This is what stops a pile flowing sideways, and it is "
-        "the knob to reach for when a heap spreads out instead of building up",
-    "Noodle Radius":
-        "Half the noodle thickness. Also the performance dial, twice over: the "
-        "point count is derived from it, and thicker noodles fall fewer "
-        "segment-lengths per frame so they tolerate fewer Substeps. It is the "
-        "radius that has to move whenever Substeps does - halving one and "
-        "leaving the other alone is what puts the sim in slow motion. Measured "
-        "at 120 noodles on the default scene, r2.5 with 8 substeps costs about "
-        "380 ms a frame; r5.0 with 4 substeps costs about 143 ms and settles in "
-        "the same number of frames, and it collides slightly better too",
-    "Substeps":
-        "Times the frame is subdivided. This is what stops fast noodles "
-        "tunnelling through each other, and it is the bulk of the cost. It is "
-        "also half of what sets the fall speed, because the velocity clamp is "
-        "one segment per substep - so lowering this without raising Noodle "
-        "Radius makes the sim slower to watch, not faster to run. Raise it "
-        "first when tunnelling appears; reduce Iterations before touching it. "
-        "Values above 24 are capped to keep evaluation time predictable",
-    "Iterations":
-        "Constraint passes per substep. 2 is enough; below that the solve "
-        "falls apart, above it costs time for very little. Values above 12 "
-        "are capped to keep playback responsive",
-    "Stiffness":
-        "Bending resistance, 1 rigid and 0 a free chain. Solved as XPBD, so "
-        "it does not drift much when Substeps or Iterations change",
-    "Self Collision":
-        "Strength of noodle-against-noodle contact. This is what builds a "
-        "pile; at 0 the noodles fall through each other",
-    "Collider":
-        "Any closed mesh to collide with. It is read as a distance field, so "
-        "the normals can face either way and it can be animated. A bowl or "
-        "plate needs thickness - add a Solidify modifier. The floor at z=0 "
-        "stays active as well",
-    "Collider Collection":
-        "Collide with every mesh in a collection, joined with the Collider "
-        "object. Ten colliders cost the same lookups as one - they share a "
-        "single distance field",
-    "Collider Margin":
-        "Extra clearance held against the collider only. Useful when a "
-        "low-poly collider's flat faces cut inside the shape it represents",
-    "Collider Friction":
-        "Friction against the collider, separate from noodle-on-noodle. A "
-        "plate is slipperier than wet pasta on wet pasta",
-    "Sticky Collider":
-        "A second set of colliders with its own stickiness, for when one "
-        "number cannot cover the scene - chopsticks that lift noodles out of "
-        "a bowl that lets them go. Collides exactly like the first set; only "
-        "the grip differs. Costs a second distance field, about 8 ms a frame",
-    "Sticky Collider Grip":
-        "Stickiness for the Sticky Collider set only, leaving Collider "
-        "Stickiness to the bowls and plates",
-    "Collider Stickiness":
-        "How strongly noodles cling to the collider just past touching - what "
-        "lets strands lift with a chopstick or hang off a tilting plate. Free, "
-        "like Cohesion: it reuses the distance the contact already measured. "
-        "Raise Collider Friction alongside it, or they slide off sideways",
-    "Length Variation":
-        "Spread of noodle lengths about Noodle Length. Each noodle is "
-        "resampled to its own length, so they all keep the point spacing "
-        "collision needs",
-    "Spawn Coil":
-        "How coiled each noodle starts. 1 drops loose nests, which is what a "
-        "floppy noodle actually does; 0 drops straight vertical rods",
-    "Cohesion":
-        "How strongly noodles cling just past touching. Cooked pasta sticks "
-        "to itself; at 0 the pile behaves like dry sticks. Nearly free - it "
-        "reuses the neighbour search collision already pays for",
+    "Noodle Count": "Number of strands. More strands increase simulation and surface cost",
+    "Noodle Length": "Strand length in metres. Longer strands need more simulation points",
+    "Noodle Radius": "Half thickness in metres. Smaller radii need more points and substeps",
+    "Length Variation": "Random fraction above and below the strand length",
+    "Profile Faces": "Tube sides: 4 for preview, 6 to 8 for a smoother surface. Does not change physics",
+    "Fill Diameter": "Diameter of the spawn disc in metres",
+    "Start Height": "Spawn origin above the local floor in metres; coils can extend below this",
+    "Spawn Coil": "1 starts loose coils; 0 starts upright strands",
+    "Seed": "Repeatable random layout and strand lengths",
+    "Gravity": "Downward acceleration in metres per second squared; Earth gravity is 9.81",
+    "Damping": "Air drag fraction per 1/24 second, adjusted for scene FPS and substeps",
+    "Stiffness": "XPBD bending resistance: 0 flexible, 1 rigid",
+    "Adaptive Substeps": "Use current maximum speed plus gravity to spend fewer substeps on slow frames",
+    "Substeps": "Maximum steps per frame (1 to 24). Too few clamp fall speed. Use Fit Step Budget after changing scale or FPS",
+    "Iterations": "Constraint passes per substep (1 to 12); start with 2",
+    "Self Collision": "Noodle contact strength; 0 allows strands to pass through one another",
+    "Friction": "Sideways contact friction against noodles and the floor",
+    "Cohesion": "Attraction between nearby strands; 0 is dry, higher values clump",
+    "Collider": "Closed mesh collider. Add thickness to open bowls with Solidify. The local floor remains active",
+    "Collider Collection": "Additional closed meshes, joined into one distance field per frame",
+    "Collider Margin": "Extra clearance from collider surfaces in metres",
+    "Collider Friction": "Sideways friction against collider surfaces",
+    "Collider Stickiness": "Attraction to nearby collider surfaces",
+    "Sticky Collider": "Second collider collection with independent grip; adds a second distance field",
+    "Sticky Collider Grip": "Attraction to the sticky collection surfaces",
 }
 
 
@@ -416,7 +257,8 @@ def ensure_material():
     put("Base Color", (0.94, 0.80, 0.44, 1.0))
     put("Roughness", 0.35)
     put("Subsurface Weight", 0.22)
-    put("Subsurface Radius", (0.9, 0.55, 0.25))
+    put("Subsurface Radius", (0.0009, 0.00055, 0.00025))
+    put("Subsurface Scale", 1.0)
     put("IOR", 1.42)
 
     # np_id -> white noise -> one uncorrelated random per strand.
@@ -452,15 +294,18 @@ def ensure_material():
 
 def build_group():
     """Build (or rebuild) the Noodle Physics node group and return it."""
-    old = bpy.data.node_groups.get(NG_NAME)
-    if old:
-        bpy.data.node_groups.remove(old)
     ng = bpy.data.node_groups.new(NG_NAME, "GeometryNodeTree")
+    ng["noodle_physics_version"] = 2
     nodes, links = ng.nodes, ng.links
 
     ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    panels = {title: ng.interface.new_panel(title, default_closed=closed)
+              for title, closed, names in CONTROL_GROUPS}
+    parents = {name: panels[title] for title, closed, names in CONTROL_GROUPS
+               for name in names}
     for name, stype, default, lo, hi, subtype in PARAMS:
-        s = ng.interface.new_socket(name, in_out="INPUT", socket_type=stype)
+        s = ng.interface.new_socket(name, in_out="INPUT", socket_type=stype,
+                                    parent=parents[name])
         if default is not None:
             s.default_value = default
             if lo is not None:          # booleans carry no range
@@ -689,30 +534,37 @@ def build_group():
     # The alternative, letting a point cross several segments per step, was
     # measured: it put 65-82% of points inside another noodle. Holding the
     # step to one segment instead fixes that, but applied to the whole frame
-    # it also caps terminal velocity at one segment per frame - 120 units/s
-    # here, a slow-motion fall. Substeps buy back the speed: the cap scales
+    # it also caps terminal velocity at one segment per frame, a slow-motion
+    # fall. Substeps buy back the speed: the cap scales
     # with the substep count, so 8 substeps means 8x the fall speed at the
     # same collision accuracy, for 8x the solve.
     sub_in = nd("GeometryNodeRepeatInput", 20, 2)
     sub_out = nd("GeometryNodeRepeatOutput", 78, 1)
     sub_in.pair_with_output(sub_out)
-    # The socket is the count. It also sets the fall-speed cap, because the
-    # clamp below is rest/dt and dt is the frame divided by this number - so
-    # lowering it without raising Noodle Radius puts the sim in slow motion
-    # rather than speeding it up. Only the runtime ceiling is applied here.
-    #
-    # A previous version derived this from gravity and frame_dt instead, to
-    # avoid spending the full budget on easy frames. That quantity is the
-    # distance fallen in one frame *from rest*, which is not what the clamp
-    # bounds: the clamp bounds the displacement actually achieved. On the
-    # default scene it evaluated to 386 * (1/24)^2 / (5 * 0.85) = 0.158, whose
-    # square root is 0.397, so CEIL returned 1 on every frame at 24 fps.
-    # Substeps stopped changing fall speed at all - 8 and 24 measured
-    # bit-identical, both 4.301 units a frame - and the default preset ran
-    # 9.4x slow. Deriving the count from the achieved speed is the only form
-    # that works, and the clamp below already bounds that to one segment per
-    # substep, so the budget cannot run away.
+    # Substeps is the hard user budget; adaptation spends only what is needed.
     runtime_substeps = math("MINIMUM", P["Substeps"], MAX_RUNTIME_SUBSTEPS, 20, 3)
+    runtime_substeps = math("MAXIMUM", runtime_substeps, 1.0, 19, 8)
+    # Predict this frame's fastest displacement from the *stored velocity*,
+    # including one full frame of gravity. A from-rest estimate alone makes
+    # accelerating noodles hit the clamp and silently run in slow motion.
+    speeds = nd("GeometryNodeAttributeStatistic", 17, 10,
+                data_type="FLOAT", domain="POINT")
+    plug(speeds.inputs["Geometry"], state)
+    plug(speeds.inputs["Attribute"],
+         vmath("LENGTH", named(ATTR_VEL, "FLOAT_VECTOR", 15, 10), None, 16, 10))
+    predicted = math("ADD", speeds.outputs["Max"],
+                     math("MULTIPLY", P["Gravity"], frame_dt, 17, 11), 18, 10)
+    needed = math("CEIL", math("DIVIDE",
+                  math("MULTIPLY", predicted, frame_dt, 18, 11),
+                  math("MULTIPLY", diameter, VELOCITY_SAFETY, 18, 12), 19, 10),
+                  None, 19, 11)
+    adaptive = math("MINIMUM", runtime_substeps,
+                    math("MAXIMUM", needed, 2.0, 19, 12), 20, 10)
+    step_switch = nd("GeometryNodeSwitch", 20, 11, input_type="INT")
+    plug(step_switch.inputs["Switch"], P["Adaptive Substeps"])
+    plug(step_switch.inputs["False"], runtime_substeps)
+    plug(step_switch.inputs["True"], adaptive)
+    runtime_substeps = step_switch.outputs["Output"]
     plug(sub_in.inputs["Iterations"], runtime_substeps)
     plug(sub_in.inputs["Geometry"], state)
     state = sub_in.outputs["Geometry"]
@@ -736,11 +588,10 @@ def build_group():
     velocity = vmath("ADD", velocity,
                      xyz(0.0, 0.0, math("MULTIPLY", math("MULTIPLY", P["Gravity"], -1.0, 22, 4), dt, 23, 4), 23, 5),
                      24, 3)
-    # Damping is quoted per frame, so take the substep's share of it -
-    # otherwise raising Substeps would silently make the air thicker.
+    # Drag is calibrated at 24 fps and integrated over seconds at any scene FPS.
     velocity = vmath("SCALE", velocity,
                      math("POWER", math("SUBTRACT", 1.0, P["Damping"], 23, 6),
-                          math("DIVIDE", 1.0, substeps, 23, 7), 24, 6), 25, 3)
+                          math("MULTIPLY", dt, 24.0, 23, 7), 24, 6), 25, 3)
     # Catch a constraint spike before it throws noodles to infinity and ruins
     # the cache. One segment per substep is also exactly the bound collision
     # sampling needs, so the guard and the accuracy limit are the same number.
@@ -758,8 +609,7 @@ def build_group():
     # Re-querying every iteration sounds better and measured identically -
     # 37.9% and 47.7% of points overlapping, against 37.9% and 47.8% - for
     # 12.5x the time (186s against 15s per 150 frames). The substep loop
-    # already refreshes this eight times a frame, which is where the freshness
-    # that matters comes from.
+    # refreshes the query on every substep.
     nearest = nd("GeometryNodeIndexOfNearest", 33, 3)
     plug(nearest.inputs["Position"], position)
     state = store(state, ATTR_NEAR, nearest.outputs["Index"], "INT", 34, 1)
@@ -814,6 +664,14 @@ def build_group():
 
     grid = make_grid(collider, 34, 8)
     sticky_grid = make_grid(sticky_real.outputs["Geometry"], 34, 10)
+
+    def has_faces(geometry, row):
+        size = nd("GeometryNodeAttributeDomainSize", 30, row, component="MESH")
+        plug(size.inputs["Geometry"], geometry)
+        return math("GREATER_THAN", size.outputs["Face Count"], 0.0, 31, row)
+
+    has_plain = has_faces(collider, 12)
+    has_sticky = has_faces(sticky_real.outputs["Geometry"], 13)
 
     def sdf_at(grid, p, col, row):
         n = nd("GeometryNodeSampleGrid", col, row, data_type="FLOAT")
@@ -1072,8 +930,9 @@ def build_group():
                        math("MULTIPLY", diameter, COHESION_REACH - 1.0, 54, 8), 54, 9)
     pull_cap = math("MULTIPLY", math("MULTIPLY", rest, PUSH_LIMIT, 54, 10), -1.0, 54, 11)
 
-    def collider_pass(solve, grid, stickiness, col, row):
+    def collider_pass(solve, grid, stickiness, present, col, row):
         """Push out of one field, cling to it, and report the distance."""
+        incoming = solve
         d_i, grad_i = sdf_probe(grid, position, col, row)
         # Outside the narrow band the grid is a constant, so the gradient is
         # exactly zero. That doubles as the "is there a collider at all" test:
@@ -1105,10 +964,20 @@ def build_group():
                      math("MULTIPLY", 1e9,
                           math("SUBTRACT", 1.0, in_band, col + 6, row + 6),
                           col + 7, row + 6), col + 8, row + 6)
-        return solve, gated
+        # Geometry switches are lazy: an unassigned collider should not run
+        # seven SDF samples and a Set Position on every constraint iteration.
+        geometry_switch = nd("GeometryNodeSwitch", col + 11, row, input_type="GEOMETRY")
+        plug(geometry_switch.inputs["Switch"], present)
+        plug(geometry_switch.inputs["False"], incoming)
+        plug(geometry_switch.inputs["True"], solve)
+        distance_switch = nd("GeometryNodeSwitch", col + 11, row + 1, input_type="FLOAT")
+        plug(distance_switch.inputs["Switch"], present)
+        plug(distance_switch.inputs["False"], 1e9)
+        plug(distance_switch.inputs["True"], gated)
+        return geometry_switch.outputs["Output"], distance_switch.outputs["Output"]
 
-    solve, d_plain = collider_pass(solve, grid, P["Collider Stickiness"], 55, 8)
-    solve, d_stick = collider_pass(solve, sticky_grid, P["Sticky Collider Grip"], 55, 16)
+    solve, d_plain = collider_pass(solve, grid, P["Collider Stickiness"], has_plain, 55, 8)
+    solve, d_stick = collider_pass(solve, sticky_grid, P["Sticky Collider Grip"], has_sticky, 55, 16)
     # Friction only cares which surface is nearest, not which set it came from.
     solve = store(solve, ATTR_CDIST, math("MINIMUM", d_plain, d_stick, 66, 12),
                   "FLOAT", 67, 12)
@@ -1211,17 +1080,34 @@ def build_group():
 
 
 def build_object(ng):
-    """Create (or replace) the object carrying the solver."""
-    old = bpy.data.objects.get(OBJ_NAME)
-    if old:
-        data = old.data
-        bpy.data.objects.remove(old)
-        if data and not data.users:
-            bpy.data.meshes.remove(data)
+    """Create an independent solver without deleting existing scene content."""
     obj = bpy.data.objects.new(OBJ_NAME, bpy.data.meshes.new(OBJ_NAME))
     bpy.context.scene.collection.objects.link(obj)
     obj.modifiers.new("Noodles", "NODES").node_group = ng
+    obj["noodle_physics_version"] = 2
     return obj
+
+
+def noodle_modifier(obj):
+    if obj is None:
+        return None
+    return next((m for m in obj.modifiers if m.type == "NODES" and m.node_group
+                 and m.node_group.get("noodle_physics_version") == 2), None)
+
+
+def input_property(obj, ng, name):
+    socket = next((s for s in ng.interface.items_tree
+                   if s.item_type == "SOCKET" and s.in_out == "INPUT"
+                   and s.name == name), None)
+    modifier = next((m for m in obj.modifiers if m.type == "NODES"
+                     and m.node_group == ng), None)
+    if socket is None or modifier is None:
+        raise CliError(f"noodle input {name!r} is unavailable on {obj.name!r}")
+    return getattr(modifier.properties.inputs, socket.identifier)
+
+
+def get_input(obj, ng, name):
+    return input_property(obj, ng, name).value
 
 
 def set_input(obj, ng, name, value):
@@ -1232,11 +1118,7 @@ def set_input(obj, ng, name, value):
         available = [s.name for s in ng.interface.items_tree
                      if getattr(s, "item_type", None) == "SOCKET"]
         raise CliError(f"node-group socket {name!r} is missing; available: {available}")
-    identifier = socket.identifier
-    inputs = getattr(obj.modifiers[0].properties, "inputs", None)
-    target = getattr(inputs, identifier, None)
-    if target is None:
-        raise CliError(f"modifier input for socket {name!r} is unavailable")
+    target = input_property(obj, ng, name)
     target.value = value
 
     # Writing an Object or Collection socket this way does not rebuild the
@@ -1259,7 +1141,7 @@ def bake(obj, frames, report=None):
     scene = bpy.context.scene
     history = {}
     for frame in range(1, frames + 1):
-        scene.frame_set(frame)
+        scene.frame_set(scene.frame_start + frame - 1)
         evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
         mesh = evaluated.to_mesh()
         try:
@@ -1276,123 +1158,41 @@ def bake(obj, frames, report=None):
     return history
 
 
-# Measured realtime presets (Blender 5.2, this repo's benchmark harness).
-#
-# The metric that matters is wall-clock time for the pile to actually fall and
-# settle, NOT ms per frame. Those are different numbers, and optimising the
-# second one alone produces a simulation that is cheaper per frame and slower
-# to watch - which is worse than doing nothing.
-#
-# The reason is the velocity clamp: top_speed = rest * VELOCITY_SAFETY / dt, and
-# rest is the point spacing, which is the diameter. So, with fps the frame rate,
-#
-#     fall speed cap = 2 * radius * VELOCITY_SAFETY * substeps * fps
-#     cost           ~ substeps * points  ~  substeps / radius
-#
-# Fall speed is proportional to radius*substeps; cost is proportional to
-# substeps/radius. Hold the speed fixed and cost goes as substeps^2 - so the
-# fast direction is FEWER substeps with proportionally FATTER noodles, and
-# cutting substeps without raising the radius just puts the sim in slow motion.
-# The default caps at 2*2.5*0.85*8*24 = 816 units/s; every preset here lands
-# within 15% of that budget. tests/test_cli.py asserts the budget is held and
-# tests/test_fall_speed.py asserts the formula itself, because both of these
-# have been wrong in this file before.
-#
-# `substeps_for()` below is how to pick the number for a new scene: it is the
-# smallest count whose clamp still lets the scene fall at the speed free fall
-# would reach from its own Start Height.
-#
-# Measured, 120 noodles, `--bench <preset> 120 110`, Windows 11 / Blender 5.2.0
-# LTS. ms/frame includes a full vertex readback the bench needs for the settle
-# metric and normal playback does not pay, so treat the ratios as the signal,
-# not the absolute fps. Frames-to-settle is the portable column - it is the same
-# on any machine - and it is the one to compare against after a solver change:
-#
-#   preset    settings      ms/frame   frames   settle    vs default
-#   default   8 sub, r2.5      379       87     33.0 s      1.00x
-#   quality   4 sub, r5.0      143       97     13.9 s      2.64x
-#   balanced  3 sub, r7.0      109       99     10.8 s      3.47x
-#   fast      2 sub, r9.0       62      100      6.2 s      6.11x
-#
-# These absolute ms numbers move by ~2x between machines and Blender builds; the
-# frame counts do not. Re-run the bench rather than trusting either.
-#
-# The scaling is not linear in substeps/radius: 'fast' is cheaper than the ratio
-# predicts and 'balanced' beats 'quality' by 1.3x rather than landing level with
-# it. The nearest-neighbour query dominates and its cost falls off a cliff once
-# the point count drops far enough, so measure rather than interpolate when
-# adding a preset. An earlier version of this table claimed 'balanced' was level
-# with 'quality' and that 'fast' was 11x cheaper; on the same machine today it
-# is 1.3x and 2.3x. Re-run the bench.
+def substeps_for(radius, gravity, start_height, fps=24.0, headroom=1.0):
+    """Conservative, uncapped step budget for a fall from rest.
+
+    Return the ceiling, never round down. Callers can then report when the
+    required budget exceeds MAX_RUNTIME_SUBSTEPS instead of hiding the deficit.
+    """
+    values = (radius, gravity, start_height, fps, headroom)
+    if not all(isfinite(v) for v in values):
+        raise ValueError("step-budget inputs must be finite")
+    if radius <= 0 or fps <= 0 or headroom < 1 or gravity < 0 or start_height < 0:
+        raise ValueError("positive radius/fps, nonnegative gravity/height and headroom >= 1 required")
+    speed = sqrt(2.0 * gravity * start_height)
+    return max(1, ceil(headroom * speed / (2.0 * radius * VELOCITY_SAFETY * fps)))
+
+
+# All presets describe tabletop noodles in metres. Count limits are starting
+# points for preview workloads, not an FPS guarantee. Quality changes thickness.
 REALTIME_PRESETS = {
-    # name: (overrides dict, suggested max noodle count for the fps quoted)
-    # "default" is the reference scene already in PARAMS, so it overrides
-    # nothing. It is a real entry rather than a special case so that the list
-    # of names cannot drift from the table - the old early-return version
-    # advertised this name in the README and then raised KeyError on it.
-    "default":  ({}, 120),
-    "quality":  ({"Substeps": 4, "Iterations": 2, "Noodle Radius": 5.0,
-                  "Profile Faces": 5}, 120),
-    "balanced": ({"Substeps": 3, "Iterations": 2, "Noodle Radius": 7.0,
-                  "Profile Faces": 4}, 120),
-    "fast":     ({"Substeps": 2, "Iterations": 2, "Noodle Radius": 9.0,
-                  "Profile Faces": 4}, 120),
+    "default": ({}, 48),
+    "quality": ({"Noodle Radius": 0.004, "Substeps": 20,
+                 "Profile Faces": 8}, 48),
+    "balanced": ({"Noodle Radius": 0.006, "Substeps": 14,
+                  "Profile Faces": 5}, 48),
+    "fast": ({"Noodle Radius": 0.009, "Substeps": 10,
+              "Profile Faces": 4}, 32),
 }
 
-
-def substeps_for(radius, gravity, start_height, fps=24.0, headroom=1.0):
-    """Fewest substeps whose velocity clamp still allows a full-speed fall.
-
-    The clamp is top_speed = rest * VELOCITY_SAFETY / dt, which per frame is
-    2 * radius * VELOCITY_SAFETY * substeps * fps, and free fall from
-    `start_height` reaches sqrt(2*g*h). Ask for fewer substeps than this and the
-    clamp bites every frame: the sim does not get faster, it goes into slow
-    motion, which is the one failure mode that looks like a performance win in a
-    ms-per-frame benchmark.
-
-    Rounded rather than ceiled, because the file's own defaults sit fractionally
-    under the bound. Raise `headroom` above 1.0 to insist on the full unclamped
-    speed.
-    """
-    reach = (2.0 * gravity * max(start_height, 0.0)) ** 0.5
-    need = headroom * reach / (2.0 * max(radius, 1e-9) * VELOCITY_SAFETY * fps)
-    return max(1, int(round(need)))
-
-
-# Unit presets. The defaults in PARAMS are inches - a noodle 1000 units long is
-# 25 m, and gravity 386 in/s2 IS real gravity, so the timing is already correct
-# for a 25 m noodle. Shrinking that with object scale does not shrink the
-# physics with it: the solve still takes as long as a 25 m fall, so a scene
-# scaled to 0.003 reads about 3x slower than reality. Rebuilding at the size you
-# actually want is the fix, and it is safe - the solver is scale-invariant to
-# within 0.5% over a 333x change in unit size (measured, both pile height and
-# reach normalised by noodle length).
-#
-# Real 2 mm spaghetti at 9.81 is genuinely expensive: it falls a segment every
-# half frame, so the clamp above wants ~50 substeps. Thick noodles are the way
-# out, exactly as they were for the realtime presets - fewer points AND fewer
-# substeps. These are udon rather than spaghetti, which is the honest cost.
-_METRIC = dict(length=0.5, start=0.35, fill=0.2, gravity=9.81)
-
+# Keep the existing CLI names as explicit larger metric scenes.
 UNIT_PRESETS = {
-    # ~16 mm thick, 31 points a noodle. The general-purpose metric scene.
-    "metric": ({"Noodle Length": _METRIC["length"],
-                "Noodle Radius": 0.008,
-                "Start Height": _METRIC["start"],
-                "Fill Diameter": _METRIC["fill"],
-                "Gravity": _METRIC["gravity"],
-                "Substeps": substeps_for(0.008, _METRIC["gravity"], _METRIC["start"]),
-                "Iterations": 2,
-                "Profile Faces": 5}, 120),
-    # ~24 mm thick, 21 points a noodle. Chunkier, but cheap enough to scrub.
-    "metric_fast": ({"Noodle Length": _METRIC["length"],
-                     "Noodle Radius": 0.012,
-                     "Start Height": _METRIC["start"],
-                     "Fill Diameter": _METRIC["fill"],
-                     "Gravity": _METRIC["gravity"],
-                     "Substeps": substeps_for(0.012, _METRIC["gravity"], _METRIC["start"]),
-                     "Iterations": 2,
-                     "Profile Faces": 4}, 120),
+    "metric": ({"Noodle Length": 0.5, "Noodle Radius": 0.008,
+                "Start Height": 0.35, "Fill Diameter": 0.2,
+                "Substeps": 17, "Profile Faces": 5}, 48),
+    "metric_fast": ({"Noodle Length": 0.5, "Noodle Radius": 0.012,
+                     "Start Height": 0.35, "Fill Diameter": 0.2,
+                     "Substeps": 12, "Profile Faces": 4}, 48),
 }
 
 
@@ -1411,26 +1211,29 @@ def lookup_preset(name):
 
 
 def apply_realtime(obj, ng, preset="balanced"):
-    """Push a preset onto an already-built noodle object.
-
-    'default' resolves to an empty override set, so it is a no-op rather than
-    a branch. Returns obj for chaining.
-    """
+    """Apply a complete preset; preserve count, seed, and collider assignments."""
     overrides, _ = lookup_preset(preset)
-    for name, value in overrides.items():
+    controlled = {"Noodle Length", "Noodle Radius", "Start Height", "Fill Diameter",
+                  "Gravity", "Substeps", "Iterations", "Profile Faces", "Adaptive Substeps"}
+    values = {name: default for name, stype, default, lo, hi, subtype in PARAMS
+              if name in controlled}
+    values.update(overrides)
+    for name, value in values.items():
         set_input(obj, ng, name, value)
+    obj["noodle_preset"] = preset
     return obj
 
 
 def bench(preset="default", count=120, frames=90):
-    """Time a run and report BOTH ms/frame and wall-clock time to settle.
+    """Report evaluation cost, readback cost and a fall-progress threshold.
 
-    Reporting ms/frame alone is how you end up shipping a preset that is
-    cheaper per frame and slower to watch: the velocity clamp ties fall speed
-    to radius*substeps, so a cheap preset can simply be in slow motion. The
-    settle time is the number that reflects what the user actually waits for.
+    A height threshold measures progress, not physical rest. Timings exclude
+    viewport drawing and include surface generation; do not label them live FPS.
     """
     import time
+    require_preset(preset)
+    count = positive_int(count, "count")
+    frames = positive_int(frames, "frames")
     ng = build_group()
     obj = build_object(ng)
     set_input(obj, ng, "Noodle Count", count)
@@ -1440,34 +1243,42 @@ def bench(preset="default", count=120, frames=90):
     scene = bpy.context.scene
     dg = bpy.context.evaluated_depsgraph_get
 
-    tops, times = [], []
+    tops, times, evaluation_times = [], [], []
     for f in range(1, frames + 1):
         t = time.perf_counter()
-        scene.frame_set(f)
+        scene.frame_set(scene.frame_start + f - 1)
         evaluated = obj.evaluated_get(dg())
         mesh = evaluated.to_mesh()
+        evaluation_times.append((time.perf_counter() - t) * 1000.0)
         try:
             if not mesh.vertices:
                 raise RuntimeError(f"frame {f} produced no evaluated vertices")
             zs = [v.co.z for v in mesh.vertices]
-            times.append((time.perf_counter() - t) * 1000.0)
             tops.append(max(zs))
         finally:
             evaluated.to_mesh_clear()
+        times.append((time.perf_counter() - t) * 1000.0)
 
 
     steady = sorted(times[5:] if len(times) > 6 else times)
     mean = sum(steady) / len(steady)
-    # "Settled" = pile top has come down to a quarter of its spawn height.
+    # Drop progress only: a pile can cross this threshold while still moving,
+    # and a tall, stable pile may never cross it at all.
     target = tops[0] * 0.25
     hit = next((i + 1 for i, z in enumerate(tops) if z <= target), None)
-    settle = f"{hit * mean / 1000:.2f}s over {hit} frames" if hit else \
-             f"NOT SETTLED in {frames} frames (slow motion?)"
+    progress = f"{sum(times[:hit]) / 1000:.2f}s wall time, frame {hit}" if hit else \
+               f"not reached in {frames} frames (tall piles may stay above it)"
+    evaluation = evaluation_times[5:] if len(times) > 6 else evaluation_times
+    eval_mean = sum(evaluation) / len(evaluation)
+    p95 = steady[max(0, ceil(0.95 * len(steady)) - 1)]
+    frame_budget = 1000 * scene.render.fps_base / scene.render.fps
 
     print(f"BENCH preset={preset} count={count} frames={frames}")
-    print(f"  mean {mean:7.1f} ms/frame ({1000.0/mean:5.1f} fps)"
-          f"  median {steady[len(steady)//2]:7.1f} ms")
-    print(f"  settle: {settle}")
+    print(f"  total mean {mean:7.1f} ms/frame ({1000.0/mean:5.1f} frames/s headless)"
+          f"  median {steady[len(steady)//2]:7.1f} ms  p95 {p95:.1f} ms")
+    print(f"  evaluation {eval_mean:.1f} ms; timeline budget {frame_budget:.1f} ms; "
+          f"{'WITHIN' if p95 <= frame_budget else 'OVER'} budget at p95 (viewport excluded)")
+    print(f"  25% spawn-height threshold: {progress}")
     return mean, hit
 
 
@@ -1523,9 +1334,216 @@ def self_check():
           f"  floor {low:.2f}  reach {reach:.1f}")
 
 
+def recommended_substeps(obj, ng, scene):
+    # Include the full possible strand height, including length variation.
+    height = get_input(obj, ng, "Start Height") + get_input(obj, ng, "Noodle Length") * (
+        1.0 + get_input(obj, ng, "Length Variation"))
+    return substeps_for(get_input(obj, ng, "Noodle Radius"),
+                        get_input(obj, ng, "Gravity"), height,
+                        scene.render.fps / scene.render.fps_base)
+
+
+def reset_simulation(context, obj):
+    if context.screen and context.screen.is_animation_playing:
+        bpy.ops.screen.animation_cancel(restore_frame=False)
+    with context.temp_override(object=obj, active_object=obj):
+        bpy.ops.object.simulation_nodes_cache_delete(selected=False)
+    obj.update_tag()
+    context.scene.frame_set(context.scene.frame_start)
+
+
+def prepare_scene(context, obj):
+    scene = context.scene
+    scene.unit_settings.system = "METRIC"
+    scene.unit_settings.scale_length = 1.0
+    scene.unit_settings.length_unit = "METERS"
+    # Frame skipping is inappropriate for a simulation that needs every step.
+    scene.sync_mode = "NONE"
+    for selected in context.selected_objects:
+        selected.select_set(False)
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+    scene.frame_set(scene.frame_start)
+
+
+class NOODLE_OT_add(bpy.types.Operator):
+    bl_idname = "noodle.add"
+    bl_label = "Add Noodles"
+    bl_description = "Create an independent noodle simulation at metre scale"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        ng = build_group()
+        obj = build_object(ng)
+        apply_realtime(obj, ng, "balanced")
+        prepare_scene(context, obj)
+        return {"FINISHED"}
+
+
+class NOODLE_OT_preset(bpy.types.Operator):
+    bl_idname = "noodle.preset"
+    bl_label = "Apply Noodle Preset"
+    bl_description = "Change thickness and solver quality, then restart; preserve count and colliders"
+    bl_options = {"REGISTER", "UNDO"}
+    preset: bpy.props.StringProperty(default="balanced")
+
+    @classmethod
+    def poll(cls, context):
+        return noodle_modifier(context.object) is not None
+
+    def execute(self, context):
+        obj = context.object
+        apply_realtime(obj, noodle_modifier(obj).node_group, self.preset)
+        reset_simulation(context, obj)
+        self.report({"INFO"}, f"Applied {self.preset}; thickness changed, count preserved")
+        return {"FINISHED"}
+
+
+class NOODLE_OT_reset(bpy.types.Operator):
+    bl_idname = "noodle.reset"
+    bl_label = "Restart"
+    bl_description = "Stop playback, clear this object's simulation cache and return to the start"
+    bl_options = {"UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return noodle_modifier(context.object) is not None
+
+    def execute(self, context):
+        reset_simulation(context, context.object)
+        return {"FINISHED"}
+
+
+class NOODLE_OT_fit_steps(bpy.types.Operator):
+    bl_idname = "noodle.fit_steps"
+    bl_label = "Fit Step Budget"
+    bl_description = "Calculate substeps from size, drop height, gravity and scene FPS, then restart"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return noodle_modifier(context.object) is not None
+
+    def execute(self, context):
+        obj = context.object
+        ng = noodle_modifier(obj).node_group
+        needed = recommended_substeps(obj, ng, context.scene)
+        set_input(obj, ng, "Substeps", min(needed, MAX_RUNTIME_SUBSTEPS))
+        reset_simulation(context, obj)
+        if needed > MAX_RUNTIME_SUBSTEPS:
+            self.report({"WARNING"}, f"Needs {needed} steps; limit is 24. Increase radius or lower drop height")
+        else:
+            self.report({"INFO"}, f"Step budget set to {needed}")
+        return {"FINISHED"}
+
+
+class NOODLE_OT_frame(bpy.types.Operator):
+    bl_idname = "noodle.frame"
+    bl_label = "Frame Noodles"
+    bl_description = "Fit the selected noodle pile in the viewport"
+
+    @classmethod
+    def poll(cls, context):
+        return noodle_modifier(context.object) is not None and context.area.type == "VIEW_3D"
+
+    def execute(self, context):
+        region = next(r for r in context.area.regions if r.type == "WINDOW")
+        with context.temp_override(region=region):
+            bpy.ops.view3d.view_selected(use_all_regions=False)
+        return {"FINISHED"}
+
+
+class NOODLE_PT_controls(bpy.types.Panel):
+    bl_label = "Noodle Physics"
+    bl_idname = "NOODLE_PT_controls"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Noodles"
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+        modifier = noodle_modifier(obj)
+        if modifier is None:
+            layout.label(text="Tabletop noodle simulation", icon="PHYSICS")
+            layout.label(text="Metres · real gravity · floor at Z = 0")
+            layout.operator("noodle.add", icon="ADD")
+            layout.label(text="Select a noodle object to edit it")
+            return
+        ng = modifier.node_group
+        row = layout.row(align=True)
+        row.operator("noodle.reset", icon="FILE_REFRESH")
+        playing = context.screen and context.screen.is_animation_playing
+        row.operator("screen.animation_play", text="Pause" if playing else "Play",
+                     icon="PAUSE" if playing else "PLAY")
+        layout.operator("noodle.frame", icon="VIEWZOOM")
+        layout.label(text="Restart after editing simulation settings", icon="INFO")
+        layout.label(text="Lengths in metres · local floor at Z = 0")
+
+        row = layout.row(align=True)
+        for name in ("fast", "balanced", "quality"):
+            row.operator("noodle.preset", text=name.title()).preset = name
+        layout.label(text="Presets change thickness; keep strand count")
+        count = get_input(obj, ng, "Noodle Count")
+        radius = get_input(obj, ng, "Noodle Radius")
+        length = get_input(obj, ng, "Noodle Length")
+        estimate = int(count * max(2, length / (2 * radius) + 1))
+        layout.label(text=f"~{estimate:,} points · {2 * radius * 1000:.1f} mm thick")
+        layout.label(text=f"{context.scene.render.fps / context.scene.render.fps_base:g} fps timeline")
+
+        if any(abs(v - 1.0) > 1e-5 for v in obj.scale):
+            box = layout.box()
+            box.alert = True
+            box.label(text="Object scale changes the apparent physics", icon="ERROR")
+            box.label(text="Use scale 1; edit Length and Radius")
+        if context.scene.unit_settings.scale_length != 1.0:
+            layout.label(text="Use scene Unit Scale 1 for metre dimensions", icon="ERROR")
+        needed = recommended_substeps(obj, ng, context.scene)
+        budget = get_input(obj, ng, "Substeps")
+        if needed > budget:
+            box = layout.box()
+            box.label(text=f"Full-height fall needs up to {needed} steps", icon="INFO")
+            box.label(text="Current budget may limit fall speed")
+        layout.operator("noodle.fit_steps", icon="SETTINGS")
+
+        for title, closed, names in CONTROL_GROUPS:
+            header, body = layout.panel("noodle_" + title, default_closed=closed)
+            header.label(text=title)
+            if body:
+                body.use_property_split = True
+                body.use_property_decorate = False
+                for name in names:
+                    body.prop(input_property(obj, ng, name), "value", text=name)
+        layout.separator()
+        layout.operator("noodle.add", text="Add Another Pile", icon="ADD")
+
+
+UI_CLASSES = (NOODLE_OT_add, NOODLE_OT_preset, NOODLE_OT_reset,
+              NOODLE_OT_fit_steps, NOODLE_OT_frame, NOODLE_PT_controls)
+
+
+def register():
+    # Run Script can be used repeatedly in the same Blender session.
+    for cls in reversed(UI_CLASSES):
+        old = getattr(bpy.types, cls.__name__, None)
+        if old is not None:
+            bpy.utils.unregister_class(old)
+    for cls in UI_CLASSES:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    for cls in reversed(UI_CLASSES):
+        old = getattr(bpy.types, cls.__name__, None)
+        if old is not None:
+            bpy.utils.unregister_class(old)
+
+
 def main():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     mode = parse_mode_args(argv)
+    if bpy.app.version < (5, 2, 0):
+        raise CliError("Noodle Physics requires Blender 5.2 or newer")
     if mode[0] == "check":
         self_check()
         return
@@ -1534,6 +1552,14 @@ def main():
         bench(preset, count, frames)
         return
 
+    register()
+    if mode[0] == "build":
+        existing = bpy.context.object if noodle_modifier(bpy.context.object) else next(
+            (obj for obj in bpy.context.scene.objects if noodle_modifier(obj)), None)
+        if existing:
+            prepare_scene(bpy.context, existing)
+            print("Noodle Physics ready. Open Viewport > Sidebar > Noodles.")
+            return
     ng = build_group()
     obj = build_object(ng)
     # --realtime [preset] on the command line, or the PRESET constant at the top
@@ -1544,13 +1570,15 @@ def main():
         _, preset = mode
     if preset:
         apply_realtime(obj, ng, preset)
+        _, maxn = lookup_preset(preset)
+        set_input(obj, ng, "Noodle Count", maxn)
+        prepare_scene(bpy.context, obj)
         overrides, maxn = lookup_preset(preset)
         print(f"Built '{NG_NAME}' with preset '{preset}': {overrides}. "
-              f"For the quoted speed keep Noodle Count near {maxn} or below. "
-              f"Play the timeline from frame 1.")
+              f"Open Viewport > Sidebar > Noodles. Play from the start frame.")
         return
-    print(f"Built '{NG_NAME}' on object '{OBJ_NAME}'. Play the timeline from "
-          f"frame 1. Slow? Set PRESET = \"fast\" at the top of this file.")
+    prepare_scene(bpy.context, obj)
+    print(f"Built '{NG_NAME}'. Open Viewport > Sidebar > Noodles.")
 
 
 

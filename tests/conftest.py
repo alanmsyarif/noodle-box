@@ -38,6 +38,14 @@ def noodle():
     return module
 
 
+@pytest.fixture(autouse=True)
+def isolated_scene():
+    """Independent test scenes, since building no longer deletes prior piles."""
+    import bpy
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    yield
+
+
 def bake_centre_of_mass(noodle, obj, frames):
     """Mean vertex z per frame.
 
@@ -68,6 +76,12 @@ def build_rod(noodle, substeps, radius=2.5, count=1):
     """
     ng = noodle.build_group()
     obj = noodle.build_object(ng)
+    # These regressions measure the original large-unit speed cap. Keep the
+    # fixture explicit now that the interactive defaults are metres.
+    for name, value in {"Noodle Length": 1000.0, "Start Height": 1250.0,
+                        "Fill Diameter": 400.0, "Gravity": 386.0,
+                        "Adaptive Substeps": False}.items():
+        noodle.set_input(obj, ng, name, value)
     noodle.set_input(obj, ng, "Noodle Count", count)
     noodle.set_input(obj, ng, "Spawn Coil", 0.0)
     noodle.set_input(obj, ng, "Stiffness", 1.0)
