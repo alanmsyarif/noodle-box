@@ -1,0 +1,10 @@
+schema_version = "1.0.0"
+id = "noodle_box"
+version = "1.0.0"
+name = "Noodle Box"
+tagline = "Simulate noodle piles with presets and a ready-to-play bowl"
+maintainer = "Noodle Box contributors"
+type = "add-on"
+tags = ["Physics", "Add Mesh", "Geometry Nodes"]
+blender_version_min = "5.2.0"
+license = ["SPDX:Apache-2.0"]

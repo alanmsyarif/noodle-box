@@ -1,9 +1,4 @@
-"""Load the single-file solver as a module.
-
-The solver deliberately stays one file that a user can open in Blender's Text
-Editor and run, so there is no package to import. This fixture loads the script
-by path instead, which keeps the repo layout exactly as shipped.
-"""
+"""Load the compatibility launcher and isolate each Blender test scene."""
 import importlib.util
 import os
 import pathlib
@@ -12,6 +7,8 @@ import sys
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 # NOODLE_SCRIPT lets the suite run against another revision of the solver, which
 # is how the regression tests were shown to fail on the code they describe:
 #   NOODLE_SCRIPT=../old/noodle_physics.py pytest tests/
