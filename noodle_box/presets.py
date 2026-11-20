@@ -41,10 +41,10 @@ LOOKS = {
                  speck_colour=(0.03, 0.022, 0.016, 1.0), bump_distance=0.00003, lumps=0.25,
                  squareness=0.7, waviness=0.0, thickness_var=0.04, end_softness=0.25),
     # Fresh rice noodle sheet: milky, very translucent, slick.
-    "rice_ribbon": dict(colour=(0.86, 0.86, 0.82, 1.0), colour_b=(0.90, 0.90, 0.86, 1.0),
+    "rice_ribbon": dict(colour=(0.87, 0.86, 0.81, 1.0), colour_b=(0.91, 0.90, 0.85, 1.0),
                         tone=0.3, roughness=0.24, coat=(0.7, 1.0), coat_roughness=0.03,
-                        sss=1.0, sss_radius=(1.0, 0.92, 0.8), sss_scale=0.0025,
-                        sss_anisotropy=0.4, transmission=0.12, blotch=0.35, striation=0.15,
+                        sss=1.0, sss_radius=(1.0, 0.92, 0.8), sss_scale=0.0018,
+                        sss_anisotropy=0.4, transmission=0.04, blotch=0.35, striation=0.15,
                         dimples=0.3, bubbles=0.4, grit=0.05, bump_distance=0.00004,
                         squareness=0.65, waviness=0.0, thickness_var=0.06, end_softness=0.18),
     # Egg pasta ribbon: egg-yellow, slightly rough, less translucent.
