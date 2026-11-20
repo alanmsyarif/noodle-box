@@ -30,10 +30,12 @@ def create_demo(context):
     collection.objects.link(noodles)
     noodles.name = "Udon - select for controls"
     apply_type(noodles, "udon", scene)
-    solver.set_input(noodles, ng, "Noodle Count", 24)
-    # The portion is poured as loose loops that stay inside Fill Diameter,
-    # which here is the bowl's well (the inner wall is 18.7 cm across at the
-    # lip) less a margin, so every strand lands inside.
+    # A generous serving: a full mound in the well (36 strands, about 0.7 L
+    # of noodle).
+    solver.set_input(noodles, ng, "Noodle Count", 36)
+    # The portion is lowered in as a loose coil of broad loops that stays
+    # inside Fill Diameter - the bowl's well (the inner wall is 18.7 cm
+    # across at the lip) less a margin - so every strand lands inside.
     solver.set_input(noodles, ng, "Fill Diameter", .13)
     solver.set_input(noodles, ng, "Collider", bowl)
     # Wet noodle on glazed stoneware is slippery: Coulomb coefficient ~0.3.
@@ -50,10 +52,10 @@ def create_demo(context):
                "Select 'Udon - select for controls'. Open the 3D Viewport sidebar (N), Noodles tab.\n"
                "Play from frame 1. Restart clears the simulation so you can change settings.\n"
                "Choose a noodle type, then Apply Type; thin noodles can need more steps than the budget.\n"
-               "The thrown stoneware bowl is a closed mesh collider (19.5 cm x 8.3 cm).\n"
+               "The thrown stoneware bowl is a closed mesh collider (19.9 cm x 8.3 cm).\n"
                "The set is lit like a food photograph: a window key behind-left, a bounce\n"
                "card front-right, a black flag and a soft room fill. The 85 mm camera\n"
-               "focuses on the 'Focus - front of noodles' empty at f/4.\n"
+               "focuses on the 'Focus - front of noodles' empty at f/2.8.\n"
                "The generated scene is separate from your previous work.\n"
                "The downloadable demo also contains an optional static frame-100 preview scene.\n")
     scene["noodle_demo"] = True

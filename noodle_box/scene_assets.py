@@ -309,7 +309,7 @@ def glaze_material(t_rim):
     n.link(n.mix(glazed, clay, glaze), bsdf.inputs["Base Color"])
 
     # Glossy glaze with slight variation; the thin kaki areas go satin.
-    gloss = n.map_range(n.noise(obj, 14.0, 2.0).outputs["Fac"], 0.3, 0.7, 0.035, 0.075)
+    gloss = n.map_range(n.noise(obj, 14.0, 3.0, 0.6).outputs["Fac"], 0.25, 0.75, 0.045, 0.12)
     gloss = n.math("ADD", gloss, n.math("MULTIPLY", thin, 0.10))
     n.link(n.mixf(glazed, 0.82, gloss), bsdf.inputs["Roughness"])
     bsdf.inputs["IOR"].default_value = 1.53
@@ -397,6 +397,26 @@ def oak_material():
     pores = n.map_range(pores, 0.68, 0.78)
     # Pores cluster in the earlywood.
     pores = n.math("MULTIPLY", pores, n.map_range(ring_f, 0.35, 0.6, 1.0, 0.3))
+    # Fine open pores (sub-millimetre dashes) everywhere, denser in earlywood.
+    fine_pores = n.noise(n.scale(g, (5200.0, 180.0, 1.0)), 1.0, 0.0).outputs["Fac"]
+    fine_pores = n.math("MULTIPLY", n.map_range(fine_pores, 0.64, 0.74),
+                        n.map_range(ring_f, 0.3, 0.7, 1.0, 0.45))
+    # Fibre: very fine lengthwise texture the eye reads as wood rather than paint.
+    fibre = n.noise(n.scale(g, (2600.0, 30.0, 1.0)), 1.0, 3.0, 0.65).outputs["Fac"]
+    # Micro-scratches in the oil finish: three families of fine straight
+    # lines at different angles, sparse, mostly visible in the sheen.
+    scratches = None
+    for k, angle in enumerate((0.35, 1.25, 2.3)):
+        ca, sa = cos(angle), sin(angle)
+        rot = n.new("ShaderNodeCombineXYZ")
+        n.link(n.math("ADD", n.math("MULTIPLY", x, ca), n.math("MULTIPLY", y, sa)), rot.inputs[0])
+        n.link(n.math("SUBTRACT", n.math("MULTIPLY", y, ca), n.math("MULTIPLY", x, sa)), rot.inputs[1])
+        n.link(float(k) * 3.1, rot.inputs[2])
+        line = n.noise(n.scale(rot.outputs[0], (4.0, 1800.0, 1.0)), 1.0, 1.0, 0.5).outputs["Fac"]
+        line = n.map_range(line, 0.70, 0.78)
+        mask = n.map_range(n.noise(n.scale(rot.outputs[0], (6.0, 14.0, 1.0)), 1.0, 2.0).outputs["Fac"], 0.55, 0.68)
+        line = n.math("MULTIPLY", line, mask)
+        scratches = line if scratches is None else n.math("MAXIMUM", scratches, line)
     # Medullary ray flecks (quarter-sawn oak): short lighter lenses.
     fleck = n.voronoi(n.scale(g, (90.0, 14.0, 1.0)), 1.0, "F1")
     fleck = n.math("MULTIPLY", n.map_range(fleck.outputs["Distance"], 0.12, 0.02),
@@ -406,6 +426,11 @@ def oak_material():
     col = n.mix(n.math("MULTIPLY", ring_v, 0.65), early, late)
     col = n.mix(n.math("MULTIPLY", streak, 0.35), col, late)
     col = n.mix(n.math("MULTIPLY", pores, 0.5), col, (0.05, 0.026, 0.012, 1))
+    col = n.mix(n.math("MULTIPLY", fine_pores, 0.45), col, (0.06, 0.03, 0.013, 1))
+    fib = n.new("ShaderNodeHueSaturation")
+    n.link(col, fib.inputs["Color"])
+    n.link(n.map_range(fibre, 0.3, 0.7, 0.9, 1.1), fib.inputs["Value"])
+    col = fib.outputs["Color"]
     col = n.mix(n.math("MULTIPLY", fleck, 0.25), col, (0.22, 0.12, 0.055, 1))
     # Board-to-board tint shift.
     tint = n.math("ADD", 0.82, n.math("MULTIPLY", rnd, 0.36))
@@ -428,12 +453,18 @@ def oak_material():
     rough = n.math("ADD", rough, n.math("MULTIPLY", pores, 0.25))
     rough = n.math("ADD", rough, n.math("MULTIPLY", wear, 0.12))
     rough = n.math("ADD", rough, n.math("MULTIPLY", seam, 0.5))
+    rough = n.math("ADD", rough, n.math("MULTIPLY", fine_pores, 0.15))
+    rough = n.math("ADD", rough, n.math("MULTIPLY", scratches, 0.22))
+    rough = n.math("ADD", rough, n.math("MULTIPLY", n.math("SUBTRACT", fibre, 0.5), 0.08))
     n.link(rough, bsdf.inputs["Roughness"])
     bsdf.inputs["Specular IOR Level"].default_value = 0.45
     height = n.math("ADD", n.math("MULTIPLY", ring_v, 0.06), n.math("MULTIPLY", pores, -0.12))
     height = n.math("ADD", height, n.math("MULTIPLY", streak, 0.2))
     height = n.math("SUBTRACT", height, n.math("MULTIPLY", seam, 0.4))
-    n.link(n.bump(height, 1.0, 0.00025), bsdf.inputs["Normal"])
+    coarse = n.bump(height, 1.0, 0.00025)
+    micro = n.math("ADD", n.math("MULTIPLY", fibre, 0.5), n.math("MULTIPLY", fine_pores, -0.6))
+    micro = n.math("SUBTRACT", micro, n.math("MULTIPLY", scratches, 0.5))
+    n.link(n.bump(micro, 0.6, 0.00004, coarse), bsdf.inputs["Normal"])
     return mat
 
 
@@ -456,41 +487,67 @@ def table(collection):
 
 
 # ------------------------------------------------------------- chopsticks
+CHOPSTICK_LENGTH = 0.228
+CHOPSTICK_BUTT = 0.0075      # width across the square-ish top
+CHOPSTICK_TIP = 0.0021       # diameter at the rounded point
+
+
+def chopstick_half_width(x):
+    u = min(max(x / CHOPSTICK_LENGTH, 0.0), 1.0)
+    return 0.5 * (CHOPSTICK_BUTT + (CHOPSTICK_TIP - CHOPSTICK_BUTT) * u ** 1.1)
+
+
 def chopstick_material():
-    mat, n, bsdf = _new_material("Lacquered bamboo chopsticks")
+    """Oiled walnut hashi: dark heartwood with visible lengthwise grain."""
+    mat, n, bsdf = _new_material("Walnut chopsticks")
     obj = n.new("ShaderNodeTexCoord").outputs["Object"]
-    streak = n.noise(n.scale(obj, (5.0, 400.0, 400.0)), 1.0, 4.0, 0.6).outputs["Fac"]
-    col = n.mix(n.map_range(streak, 0.3, 0.75), (0.075, 0.036, 0.016, 1), (0.040, 0.018, 0.008, 1))
-    node = n.new("ShaderNodeSeparateXYZ")
-    n.link(obj, node.inputs[0])
-    # Bare, paler tips (the last 6 cm), as on real lacquered hashi.
-    tip = n.map_range(node.outputs["X"], 0.180, 0.184)
-    col = n.mix(tip, col, (0.22, 0.13, 0.065, 1))
+    # Grain runs along the stick (X): long lines, tight across.
+    warp = n.noise(n.scale(obj, (6.0, 60.0, 60.0)), 1.0, 2.0).outputs["Fac"]
+    sep = n.new("ShaderNodeSeparateXYZ")
+    n.link(obj, sep.inputs[0])
+    across = n.math("ADD", n.math("ADD", sep.outputs["Y"], n.math("MULTIPLY", sep.outputs["Z"], 0.6)),
+                    n.math("MULTIPLY", warp, 0.0012))
+    lines = n.math("FRACT", n.math("DIVIDE", across, 0.00055))
+    lines = n.map_range(lines, 0.55, 0.9)
+    fibre = n.noise(n.scale(obj, (40.0, 3000.0, 3000.0)), 1.0, 3.0, 0.6).outputs["Fac"]
+    tone = n.noise(n.scale(obj, (25.0, 200.0, 200.0)), 1.0, 2.0).outputs["Fac"]
+    col = n.mix(n.map_range(tone, 0.3, 0.7), (0.085, 0.042, 0.019, 1), (0.13, 0.066, 0.030, 1))
+    col = n.mix(n.math("MULTIPLY", lines, 0.85), col, (0.022, 0.011, 0.005, 1))
+    col = n.mix(n.math("MULTIPLY", n.map_range(fibre, 0.55, 0.8), 0.35), col, (0.16, 0.09, 0.045, 1))
     n.link(col, bsdf.inputs["Base Color"])
-    n.link(n.mixf(tip, 0.22, 0.6), bsdf.inputs["Roughness"])
-    n.link(n.bump(streak, 0.4, 0.0001), bsdf.inputs["Normal"])
+    # Oiled, not lacquered: a soft satin sheen, no plastic highlight.
+    n.link(n.map_range(fibre, 0.3, 0.7, 0.48, 0.62), bsdf.inputs["Roughness"])
+    bsdf.inputs["Specular IOR Level"].default_value = 0.35
+    height = n.math("ADD", n.math("MULTIPLY", lines, -0.4), fibre)
+    n.link(n.bump(height, 0.5, 0.00003), bsdf.inputs["Normal"])
     return mat
 
 
-def chopstick_mesh(name, length=0.225, butt=0.0034, tip=0.0011, sides=16):
-    """Tapered round chopstick along +X from its butt; rounded ends, closed."""
+def chopstick_mesh(name, sides=32):
+    """Japanese hashi along +X from its butt: a rounded-square section 7.5 mm
+    across at the top, turning round as it tapers to a ~2 mm point. Closed."""
     verts, faces = [], []
-    stations = 24
-    xs = [length * i / stations for i in range(stations + 1)]
+    stations = 40
+    xs = [CHOPSTICK_LENGTH * i / stations for i in range(stations + 1)]
     rings = []
-    verts.append((-0.0003, 0.0, 0.0))
+    verts.append((-0.0002, 0.0, 0.0))
     for x in xs:
-        u = x / length
-        r = butt + (tip - butt) * (u ** 1.15)
+        u = x / CHOPSTICK_LENGTH
+        h = chopstick_half_width(x)
         if x == 0.0:
-            r *= 0.85
+            h *= 0.9              # small chamfer on the butt
+        power = 5.0 + (2.0 - 5.0) * min(1.0, u / 0.75)   # square-ish -> round
         ring = []
         for k in range(sides):
-            a = tau * k / sides
+            a = tau * k / sides + pi / 4
+            c, s_ = cos(a), sin(a)
+            # Superellipse: |y|^p + |z|^p = h^p
+            y = h * (abs(c) ** (2.0 / power)) * (1 if c >= 0 else -1)
+            z = h * (abs(s_) ** (2.0 / power)) * (1 if s_ >= 0 else -1)
             ring.append(len(verts))
-            verts.append((x, r * cos(a), r * sin(a)))
+            verts.append((x, y, z))
         rings.append(ring)
-    verts.append((length + tip * 0.6, 0.0, 0.0))
+    verts.append((CHOPSTICK_LENGTH + CHOPSTICK_TIP * 0.4, 0.0, 0.0))
     first, last = 0, len(verts) - 1
     for k in range(sides):
         faces.append((first, rings[0][(k + 1) % sides], rings[0][k]))
@@ -555,9 +612,9 @@ def chopstick_rest(collection, location, angle):
     return obj
 
 
-def chopsticks(collection, rest_loc=(0.138, -0.052, 0.0), yaw_deg=103.0):
-    """A pair laid on a hashioki: tips on the rest, butts on the oak, pointing
-    toward the bowl as a leading line."""
+def chopsticks(collection, rest_loc=(0.142, 0.060, 0.0), yaw_deg=100.0):
+    """A pair laid on a hashioki to the right of the bowl: square tops on the
+    oak toward the camera, points resting on the rest, as a leading line."""
     mat = chopstick_material()
     rest_loc = Vector(rest_loc)
     yaw = radians(yaw_deg)          # direction from butt to tip
@@ -566,23 +623,26 @@ def chopsticks(collection, rest_loc=(0.138, -0.052, 0.0), yaw_deg=103.0):
     objs = [rest]
     direction = Vector((cos(yaw), sin(yaw), 0.0))
     side = Vector((-direction.y, direction.x, 0.0))
-    length, contact = 0.225, 0.17
-    for k, offset in enumerate((-0.0045, 0.0045)):
-        mesh = chopstick_mesh(f"Chopstick {k + 1}", length=length)
+    contact = CHOPSTICK_LENGTH - 0.055
+    for k, offset in enumerate((-0.0055, 0.0055)):
+        mesh = chopstick_mesh(f"Chopstick {k + 1}")
         mesh.materials.append(mat)
         obj = bpy.data.objects.new(f"Chopstick {k + 1}", mesh)
         collection.objects.link(obj)
-        u = contact / length
-        r_contact = 0.0034 + (0.0011 - 0.0034) * u ** 1.15
-        point = rest_loc + side * offset * (1.0 + 0.4 * k)
-        point.z = rest_top + r_contact
+        h_contact = chopstick_half_width(contact)
+        h_butt = chopstick_half_width(0.0)
+        point = rest_loc + side * offset
+        point.z = rest_top + h_contact
         # Splay the pair a little, as if put down by hand.
-        d = (direction + side * (0.02 if k else -0.015)).normalized()
-        flat = contact * (1.0 - ((point.z - 0.0034) / contact) ** 2) ** 0.5
+        d = (direction + side * (0.025 if k else -0.01)).normalized()
+        rise = point.z - h_butt
+        flat = (contact ** 2 - rise ** 2) ** 0.5
         butt = point - d * flat
-        butt.z = 0.0034
+        butt.z = h_butt
         obj.location = butt
-        obj.rotation_euler = (point - butt).normalized().to_track_quat("X", "Z").to_euler()
+        axis = (point - butt).normalized()
+        # Roll so a flat face of the square top sits on the table.
+        obj.rotation_euler = axis.to_track_quat("X", "Z").to_euler()
         objs.append(obj)
     return objs
 
@@ -601,7 +661,7 @@ def shino_material():
     return mat
 
 
-def teacup(collection, location=(-0.150, 0.175, 0.0)):
+def teacup(collection, location=(-0.115, 0.215, 0.0)):
     """Yunomi in the background, well out of focus, for depth."""
     profile = ((0.0, 0.0080), (0.020, 0.0084), (0.029, 0.0105), (0.0315, 0.020),
                (0.0330, 0.060), (0.0337, 0.0760), (0.0345, 0.0776), (0.0356, 0.0774),
@@ -702,13 +762,16 @@ def window_pane(collection, key):
     grad = n.map_range(y, -h / 2, h / 2, 0.7, 1.15, "LINEAR")
     # Sheer curtain folds: soft vertical bands.
     folds = n.noise(n.scale(obj, (9.0, 0.4, 1.0)), 1.0, 2.0, 0.5).outputs["Fac"]
-    grad = n.math("MULTIPLY", grad, n.map_range(folds, 0.3, 0.7, 0.8, 1.15))
-    # Mullions: one vertical, one horizontal bar, 3.5 cm.
-    bar_v = n.map_range(n.math("ABSOLUTE", x), 0.016, 0.019, 0.0, 1.0)
-    bar_h = n.map_range(n.math("ABSOLUTE", n.math("SUBTRACT", y, 0.08)), 0.016, 0.019, 0.0, 1.0)
+    grad = n.math("MULTIPLY", grad, n.map_range(folds, 0.3, 0.7, 0.62, 1.25))
+    # Mullions seen through the sheer: one vertical, one horizontal bar,
+    # softened by the diffusing curtain so they read as shadows, not cut-outs.
+    bar_v = n.map_range(n.math("ABSOLUTE", x), 0.008, 0.04, 0.45, 1.0)
+    bar_h = n.map_range(n.math("ABSOLUTE", n.math("SUBTRACT", y, 0.08)), 0.008, 0.04, 0.5, 1.0)
     frame = n.math("MULTIPLY", bar_v, bar_h)
-    edge_x = n.map_range(n.math("ABSOLUTE", x), w / 2 - 0.03, w / 2 - 0.025, 1.0, 0.0)
-    edge_y = n.map_range(n.math("ABSOLUTE", y), h / 2 - 0.03, h / 2 - 0.025, 1.0, 0.0)
+    # The curtain glows brightest in the middle and falls off toward the
+    # frame; no hard edge for the glaze to mirror.
+    edge_x = n.map_range(n.math("ABSOLUTE", x), w / 2 - 0.22, w / 2 - 0.01, 1.0, 0.08)
+    edge_y = n.map_range(n.math("ABSOLUTE", y), h / 2 - 0.18, h / 2 - 0.01, 1.0, 0.08)
     frame = n.math("MULTIPLY", frame, n.math("MULTIPLY", edge_x, edge_y))
     strength = n.math("MULTIPLY", n.math("MULTIPLY", grad, frame), key.data.energy / (w * h))
     n.link(strength, emit.inputs["Strength"])
@@ -752,7 +815,7 @@ def lights(collection):
 
 # ----------------------------------------------------------------- camera
 def camera(collection, scene, focus):
-    data = bpy.data.cameras.new("85mm f/4")
+    data = bpy.data.cameras.new("85mm f/2.8")
     cam = bpy.data.objects.new("Food camera 85mm", data)
     collection.objects.link(cam)
     data.lens = 85.0
@@ -760,9 +823,10 @@ def camera(collection, scene, focus):
     data.sensor_width = 36.0
     data.clip_start = 0.05
     data.clip_end = 20.0
-    target = Vector((0.0, 0.004, 0.045))
-    # ~34 degrees above the table, slightly from the right.
-    elevation, azimuth, distance = radians(34.0), radians(-100.0), 0.78
+    # Aimed a little right of the bowl so the chopsticks have room in the
+    # right foreground; ~34 degrees above the table, slightly from the left.
+    target = Vector((0.042, 0.006, 0.04))
+    elevation, azimuth, distance = radians(34.0), radians(-100.0), 0.86
     cam.location = target + distance * Vector((cos(elevation) * cos(azimuth),
                                                cos(elevation) * sin(azimuth), sin(elevation)))
     point_at(cam, target)
@@ -780,15 +844,22 @@ def camera(collection, scene, focus):
 
 
 # ------------------------------------------------------------------ render
-def render_settings(scene, samples=256, size=(1500, 1000)):
+def render_settings(scene, samples=256, size=(1500, 1000), threshold=0.012):
     scene.render.engine = "CYCLES"
     cy = scene.cycles
     cy.samples = samples
     cy.preview_samples = 32
     cy.use_adaptive_sampling = True
-    cy.adaptive_threshold = 0.012
+    cy.adaptive_threshold = threshold
     cy.use_denoising = True
     cy.use_preview_denoising = True
+    # Albedo + normal guides with an accurate prefilter keep fine texture
+    # (wood fibre, glaze speckle) instead of smearing it into streaks.
+    cy.denoiser = "OPENIMAGEDENOISE"
+    cy.denoising_input_passes = "RGB_ALBEDO_NORMAL"
+    cy.denoising_prefilter = "ACCURATE"
+    if hasattr(cy, "denoising_quality"):
+        cy.denoising_quality = "HIGH"
     cy.max_bounces = 12
     cy.diffuse_bounces = 4
     cy.glossy_bounces = 6
@@ -858,35 +929,47 @@ def build_set(scene, collection):
 
 # ------------------------------------------------------------- garnish
 def scallion_material():
+    """Negi: glossy dark-green skin, translucent flesh paling to white-green
+    toward the core, strong subsurface so thin layers glow in backlight."""
     mat, n, bsdf = _new_material("Scallion")
     obj = n.new("ShaderNodeTexCoord").outputs["Object"]
-    attr = n.attr("scallion_layer")
+    layer = n.attr("scallion_layer")      # 0 outer skin .. 1 innermost layer
     tone = n.noise(obj, 900.0, 2.0).outputs["Fac"]
-    green = n.mix(n.map_range(tone, 0.3, 0.7), (0.035, 0.12, 0.012, 1), (0.065, 0.18, 0.02, 1))
-    pale = (0.42, 0.50, 0.20, 1)
-    n.link(n.mix(n.map_range(attr, 0.3, 0.85, 0.0, 0.8, "LINEAR"), green, pale), bsdf.inputs["Base Color"])
-    bsdf.inputs["Roughness"].default_value = 0.25
-    bsdf.inputs["Subsurface Weight"].default_value = 0.5
-    bsdf.inputs["Subsurface Radius"].default_value = (0.0006, 0.0012, 0.0004)
-    bsdf.inputs["Subsurface Scale"].default_value = 1.0
+    skin = n.mix(n.map_range(tone, 0.3, 0.7), (0.025, 0.10, 0.010, 1), (0.05, 0.16, 0.018, 1))
+    col = n.ramp(layer, [(0.0, (0.04, 0.14, 0.015)), (0.18, (0.16, 0.34, 0.06)),
+                         (0.6, (0.40, 0.55, 0.20)), (1.0, (0.62, 0.68, 0.46))])
+    col = n.mix(n.map_range(layer, 0.0, 0.08, 1.0, 0.0), col, skin)
+    # Fine veins along the leaf.
+    veins = n.noise(n.scale(obj, (3000.0, 3000.0, 60.0)), 1.0, 2.0).outputs["Fac"]
+    col = n.mix(n.math("MULTIPLY", n.map_range(veins, 0.55, 0.75), 0.25), col, (0.10, 0.25, 0.04, 1))
+    n.link(col, bsdf.inputs["Base Color"])
+    bsdf.inputs["Roughness"].default_value = 0.3
+    bsdf.inputs["Coat Weight"].default_value = 0.4
+    bsdf.inputs["Coat Roughness"].default_value = 0.08
+    bsdf.inputs["Subsurface Weight"].default_value = 1.0
+    bsdf.inputs["Subsurface Radius"].default_value = (0.6, 1.0, 0.45)
+    bsdf.inputs["Subsurface Scale"].default_value = 0.0015
+    n.link(n.bump(veins, 0.2, 0.00003), bsdf.inputs["Normal"])
     return mat
 
 
-def _scallion_ring(verts, faces, layer, matrix, r_out, r_in, depth, rng,
-                   sweep=tau, squash=1.0, tag=0.0, sides=18):
-    """One closed scallion layer: an annulus (or a broken arc with end caps),
-    elliptic where the knife cut on a slant. 'tag' tints inner layers paler."""
+def _scallion_ring(verts, faces, layer, matrix, r_out, r_in, depth, rng, sweep,
+                   squash, tag_out, tag_in, sides=24):
+    """One closed scallion layer (a short tube): annulus, or a broken arc with
+    end caps, elliptic where the knife cut on a slant."""
     base = len(verts)
     full = sweep >= tau - 1e-6
-    count = sides if full else max(4, int(sides * sweep / tau)) + 1
+    count = sides if full else max(5, int(sides * sweep / tau)) + 1
     phase = rng.random() * tau
+    skew = rng.uniform(-0.25, 0.25) * depth   # slanted knife: faces not parallel
     for z in (-depth / 2, depth / 2):
-        for r in (r_out, r_in):
+        for r, tag in ((r_out, tag_out), (r_in, tag_in)):
             for k in range(count):
                 a = phase + sweep * k / (count if full else count - 1)
-                wob = 1.0 + 0.06 * sin(3 * a + r * 1200.0)
-                verts.append(matrix @ Vector((r * wob * cos(a) * squash, r * wob * sin(a), z)))
-                layer.append(tag + (0.35 if r == r_in else 0.0))
+                wob = 1.0 + 0.05 * sin(3 * a + r * 1200.0)
+                zz = z + (skew * cos(a) if z > 0 else 0.0)
+                verts.append(matrix @ Vector((r * wob * cos(a) * squash, r * wob * sin(a), zz)))
+                layer.append(tag)
     bo, bi, to, ti = (base + i * count for i in range(4))
     spans = count if full else count - 1
     for k in range(spans):
@@ -901,23 +984,35 @@ def _scallion_ring(verts, faces, layer, matrix, r_out, r_in, depth, rng,
         faces.append((bo + e, bi + e, ti + e, to + e))
 
 
-def _scallion_slice(verts, faces, layer, matrix, rng, size=None, depth=None):
-    """A slice of spring onion: thin green outer layer, sometimes a nested
-    paler inner layer, now and then broken into an arc."""
-    size = size or rng.uniform(0.0030, 0.0045)
-    depth = depth or rng.uniform(0.0008, 0.0016)
-    squash = rng.uniform(1.0, 1.3)
-    sweep = tau if rng.random() > 0.18 else rng.uniform(radians(150), radians(290))
-    wall = size * rng.uniform(0.2, 0.3)
-    _scallion_ring(verts, faces, layer, matrix, size, size - wall, depth, rng, sweep, squash, 0.0)
-    if rng.random() < 0.5 and sweep >= tau - 1e-6:
-        inner = size - wall * rng.uniform(1.4, 1.9)
-        _scallion_ring(verts, faces, layer, matrix, inner, inner - wall * 0.8, depth * 0.95,
-                       rng, tau, squash, 0.5)
+def _scallion_slice(verts, faces, layer, matrix, rng, size, depth):
+    """A 1.5-3 mm slice of negi: a green outer layer with one or two nested,
+    paler layers inside (separate shells with a hair of air between), now
+    and then broken into an arc."""
+    squash = rng.uniform(1.0, 1.25)
+    broken = rng.random() < 0.15
+    sweep = rng.uniform(radians(170), radians(290)) if broken else tau
+    wall = size * rng.uniform(0.16, 0.22)
+    r = size
+    layers = 1 if broken else rng.choice((2, 2, 3))
+    for i in range(layers):
+        t0 = i / 3.0
+        t1 = t0 + 0.3
+        _scallion_ring(verts, faces, layer, matrix, r, r - wall, depth * (1.0 - 0.04 * i), rng,
+                       sweep, squash, t0, t1)
+        r -= wall * 1.15
+        wall *= 0.9
+        if r - wall < size * 0.15:
+            break
 
 
-def scatter_scallions(collection, target, count=50, seed=3, table_count=3):
-    """Drop sliced scallion rings onto the baked pile (static geometry)."""
+def scatter_scallions(collection, target, count=55, seed=3, table_count=3):
+    """Drop sliced scallions onto the baked pile (static geometry).
+
+    Each slice is ray-cast straight down onto the noodle mesh, tilted to the
+    surface it lands on plus a random lean, and seated so its lowest edge
+    touches (or sinks a fraction into) the noodle. Rays that slip between
+    strands land lower in the pile, which is where real garnish ends up too.
+    """
     import random
     from mathutils.bvhtree import BVHTree
     rng = random.Random(seed)
@@ -926,33 +1021,36 @@ def scatter_scallions(collection, target, count=50, seed=3, table_count=3):
     world = target.matrix_world
     inv = world.inverted()
     verts, faces, layer = [], [], []
-    placed = 0
-    tries = 0
+    placed = tries = 0
     while placed < count and tries < count * 40:
         tries += 1
-        r = 0.058 * rng.random() ** 0.6
+        r = 0.068 * rng.random() ** 0.6
         a = rng.random() * tau
-        # Favour the front-right of the pile, where the camera looks.
+        # Favour the front of the pile, where the camera looks.
         if rng.random() < 0.45:
-            a = rng.uniform(radians(-150), radians(-20))
+            a = rng.uniform(radians(-160), radians(-20))
         origin = inv @ Vector((r * cos(a), r * sin(a), 0.2))
         hit, normal, _, _ = bvh.ray_cast(origin, Vector((0, 0, -1)))
-        if hit is None or normal.z < 0.25:
+        if hit is None or normal.z < 0.2:
             continue
         hit, normal = world @ hit, (world.to_3x3() @ normal).normalized()
-        size = rng.uniform(0.0030, 0.0045)
-        depth = rng.uniform(0.0010, 0.0018)
-        tilt = normal.lerp(Vector((rng.uniform(-1, 1), rng.uniform(-1, 1), 1)).normalized(), 0.35)
-        rot = tilt.to_track_quat("Z", "Y").to_matrix().to_4x4() @ Matrix.Rotation(rng.random() * tau, 4, "Z")
-        m = Matrix.Translation(hit + normal * depth * 0.35) @ rot
+        size = rng.uniform(0.0030, 0.0046)
+        depth = rng.uniform(0.0015, 0.0030)
+        lean = Vector((rng.uniform(-1, 1), rng.uniform(-1, 1), 0.0)) * rng.uniform(0.0, 0.9)
+        axis = (normal + lean).normalized()
+        if axis.z < 0.15:
+            axis = (axis + Vector((0, 0, 0.3))).normalized()
+        tilt = axis.angle(normal)
+        rot = axis.to_track_quat("Z", "Y").to_matrix().to_4x4() @ Matrix.Rotation(rng.random() * tau, 4, "Z")
+        rest = size * sin(tilt) + depth / 2 * cos(tilt)
+        m = Matrix.Translation(hit + normal * rest * rng.uniform(0.6, 0.9)) @ rot
         _scallion_slice(verts, faces, layer, m, rng, size, depth)
         placed += 1
-    # A couple fallen onto the table in front of the bowl.
+    # A few strays on the table in front of the bowl.
     for _ in range(table_count):
-        a = rng.uniform(radians(-140), radians(-50))
-        r = rng.uniform(0.115, 0.16)
-        size = rng.uniform(0.003, 0.004)
-        depth = 0.0012
+        a = rng.uniform(radians(-140), radians(-40))
+        r = rng.uniform(0.115, 0.15)
+        size, depth = rng.uniform(0.0032, 0.0042), rng.uniform(0.0016, 0.0024)
         m = Matrix.Translation((r * cos(a), r * sin(a), depth / 2)) @ Matrix.Rotation(rng.random() * tau, 4, "Z")
         _scallion_slice(verts, faces, layer, m, rng, size, depth)
     mesh = bpy.data.meshes.new("Scallion slices")
@@ -960,6 +1058,8 @@ def scatter_scallions(collection, target, count=50, seed=3, table_count=3):
     attr = mesh.attributes.new("scallion_layer", "FLOAT", "POINT")
     attr.data.foreach_set("value", layer)
     mesh.update()
+    for face in mesh.polygons:
+        face.use_smooth = False
     obj = bpy.data.objects.new("Garnish - scallion slices", mesh)
     collection.objects.link(obj)
     mesh.materials.append(scallion_material())
