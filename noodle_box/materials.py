@@ -29,7 +29,7 @@ import bpy
 
 # Stamped on every material so a file saved by an older add-on rebuilds its
 # noodle materials instead of silently reusing the old shader.
-LOOK_VERSION = 2
+LOOK_VERSION = 3
 
 ATTR_PROF = "nb_prof"
 ATTR_ALONG = "nb_along"
@@ -54,7 +54,11 @@ DEFAULT_LOOK = dict(
     dimples=0.3,           # shallow pits (bump)
     bubbles=0.2,           # tiny trapped air bubbles (bump + paler dots)
     grit=0.15,             # fine isotropic roughness, e.g. bronze-die pasta
-    lumps=0.4,             # soft millimetre-scale undulation of the dough
+    lumps=0.3,             # broad, low undulation of the dough (5 mm scale)
+    micro=0.5,             # fine pores/skin texture under the film (bump)
+    sparkle=0.5,           # tiny sharp ripples in the water film (coat bump)
+    wrinkles=0.0,          # creases across the strand, as in rice sheets
+    speck_size=0.3,        # largest speck radius, in speck-cell units
     specks=0.0,            # dark husk specks (soba), density 0..1
     speck_colour=(0.045, 0.032, 0.022, 1.0),
     bump_distance=0.00006,  # metres of relief at full height
@@ -244,13 +248,25 @@ def build(material, look=None):
                  b.remap(_sep(b, b.out(vb, "Color"), 7, 7).outputs[1],
                          0.8, 0.86, 0.0, 1.0, 8, 7, kind="LINEAR"), 9, 6)
     # Soft lumps a couple of millimetres across: uneven dough, swelling.
-    lumps = b.out(b.noise(uvw, 0.45, 2.0, 6, 10, roughness=0.5), "Fac")
+    lumps = b.out(b.noise(uvw, 0.18, 1.0, 6, 10, roughness=0.4), "Fac")
+    # Fine skin texture (~0.2 mm) and the film's own tiny ripples, which give
+    # the sharp micro-specular sparkle of a wet starch surface.
+    micro = b.out(b.noise(uvw, 5.0, 2.0, 6, 12, roughness=0.5), "Fac")
+    ripple = b.out(b.noise(b.vmath("ADD", uvw, (7.1, 3.3, 9.7), 5, 13), 2.2, 3.0, 6, 13,
+                           roughness=0.6), "Fac")
+    # Creases running mostly across the strand (folded rice sheet).
+    crease_n = b.out(b.noise(b.vmath("MULTIPLY", uvw, (0.25, 0.25, 1.0), 5, 14), 0.35, 2.0,
+                             6, 14, roughness=0.5, distortion=0.4), "Fac")
+    crease = b.math("SUBTRACT", 1.0, b.math("ABSOLUTE", b.math("MULTIPLY", b.math(
+        "SUBTRACT", crease_n, 0.5, 7, 14), 9.0, 8, 14), None, 9, 14), 10, 14, clamp=True)
+    # Only here and there, where the sheet happened to fold.
+    crease = b.math("MULTIPLY", crease, b.remap(lumps, 0.5, 0.62, 0.0, 1.0, 9, 15), 11, 15)
     # Fine grit, isotropic.
     grit = b.out(b.noise(uvw, 9.0, 6.0, 6, 8, roughness=0.7), "Fac")
     # Husk specks: small dark flecks of varying size and density.
     vs = b.voronoi(b.vmath("ADD", uvw, (31.7, 11.3, 5.9), 5, 9), 2.6, 6, 9)
     vs_rand = _sep(b, b.out(vs, "Color"), 7, 9)
-    speck_size = b.math("MULTIPLY", b.math("POWER", vs_rand.outputs[0], 2.0, 7, 10), 0.3, 8, 9)
+    speck_size = b.math("MULTIPLY", b.math("POWER", vs_rand.outputs[0], 2.0, 7, 10), look["speck_size"], 8, 9)
     speck_keep = b.math("LESS_THAN", vs_rand.outputs[1], look["specks"], 8, 10)
     speck = b.math("MULTIPLY",
                    b.math("LESS_THAN", b.out(vs, "Distance"), speck_size, 9, 9),
@@ -300,21 +316,27 @@ def build(material, look=None):
     height = b.math("ADD", height, term(grit, look["grit"], 11, 17, 0.5), 14, 14)
     height = b.math("ADD", height, term(blotch, 0.25, 11, 18), 15, 14)
     height = b.math("ADD", height, term(speck, 0.3 * look["specks"], 11, 19), 16, 14)
-    height = b.math("ADD", height, term(lumps, 2.5 * look["lumps"], 11, 20, 0.5), 17, 14)
-    bump = b.node("ShaderNodeBump", 18, 14)
+    height = b.math("ADD", height, term(lumps, 1.2 * look["lumps"], 11, 20, 0.5), 17, 14)
+    height = b.math("ADD", height, term(micro, 0.6 * look["micro"], 11, 21, 0.5), 18, 14)
+    height = b.math("ADD", height, term(crease, -1.5 * look["wrinkles"], 11, 22), 19, 14)
+    bump = b.node("ShaderNodeBump", 21, 14)
     b.put(bump, "Height", height)
     b.put(bump, "Strength", 1.0)
     b.put(bump, "Distance", look["bump_distance"])
     # The water film smooths micro relief; it follows only broad undulation.
     coat_height = b.math("ADD", b.math("MULTIPLY", stri, 0.25 * look["striation"], 15, 16),
-                         b.math("MULTIPLY", lumps, 2.5 * look["lumps"], 15, 17), 16, 16)
-    coat_bump = b.node("ShaderNodeBump", 18, 16)
+                         b.math("MULTIPLY", lumps, 1.2 * look["lumps"], 15, 17), 16, 16)
+    coat_height = b.math("ADD", coat_height,
+                         b.math("MULTIPLY", ripple, 0.8 * look["sparkle"], 15, 18), 17, 16)
+    coat_height = b.math("ADD", coat_height,
+                         b.math("MULTIPLY", crease, -1.2 * look["wrinkles"], 15, 19), 18, 16)
+    coat_bump = b.node("ShaderNodeBump", 21, 16)
     b.put(coat_bump, "Height", coat_height)
     b.put(coat_bump, "Strength", 1.0)
     b.put(coat_bump, "Distance", look["bump_distance"])
 
     # ------------------------------------------------------------ BSDF
-    bsdf = b.node("ShaderNodeBsdfPrincipled", 20, 2)
+    bsdf = b.node("ShaderNodeBsdfPrincipled", 23, 2)
     for prop, value in (("subsurface_method", "RANDOM_WALK"), ("distribution", "MULTI_GGX")):
         try:
             setattr(bsdf, prop, value)
@@ -335,7 +357,7 @@ def build(material, look=None):
     b.put(bsdf, "Normal", b.out(bump, "Normal"))
     b.put(bsdf, "Coat Normal", b.out(coat_bump, "Normal"))
 
-    output = b.node("ShaderNodeOutputMaterial", 23, 2)
+    output = b.node("ShaderNodeOutputMaterial", 26, 2)
     b.links.new(bsdf.outputs[0], output.inputs["Surface"])
 
     material.diffuse_color = col3(look["colour"])
