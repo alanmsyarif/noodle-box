@@ -30,7 +30,9 @@ def create_demo(context):
     collection.objects.link(noodles)
     noodles.name = "Udon - select for controls"
     apply_type(noodles, "udon", scene)
-    solver.set_input(noodles, ng, "Noodle Count", 24)
+    # A generous serving: a full mound in the well (36 strands, about 0.7 L
+    # of noodle); measured ~0.2 s/frame headless on a shared 4-core box.
+    solver.set_input(noodles, ng, "Noodle Count", 36)
     solver.set_input(noodles, ng, "Fill Diameter", .09)
     # A loose, mostly hanging spawn instead of wide flat coils: full coils
     # reach ~17 cm from the axis and drape strands over a 20 cm bowl's rim.
