@@ -815,7 +815,7 @@ def lights(collection):
 
 # ----------------------------------------------------------------- camera
 def camera(collection, scene, focus):
-    data = bpy.data.cameras.new("85mm f/4")
+    data = bpy.data.cameras.new("85mm f/2.8")
     cam = bpy.data.objects.new("Food camera 85mm", data)
     collection.objects.link(cam)
     data.lens = 85.0
