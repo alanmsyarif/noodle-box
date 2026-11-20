@@ -112,43 +112,42 @@ These are thick preview noodles. Thin spaghetti needs many more points and subst
 
 Two changes reduce solver cost:
 
-- **Adaptive Substeps** estimates the required steps from the fastest stored point velocity plus a full frame of gravity. A contact-stability minimum also limits gravity-induced movement per step to 5% of the radius. This prevents slow piles from dropping to too few steps and shaking. **Substeps** remains the maximum budget; too small a budget can still cause jitter. Disable adaptation for fixed-step comparisons.
+- **Adaptive Substeps** estimates the required steps from the fastest stored point velocity plus a full frame of gravity. A contact-stability minimum also limits gravity-induced movement per step to 10% of the radius. This prevents slow piles from dropping to too few steps and shaking. **Substeps** remains the maximum budget; too small a budget can still cause jitter. Disable adaptation for fixed-step comparisons.
 - Empty collider branches bypass their distance-field sampling and position updates. Assigned object and collection colliders still use the full contact solver.
 
 Air drag is physical (see Physics model) and every damping term is integrated over elapsed seconds, so changing timeline FPS does not change the motion over the same duration. **Damping** adds optional extra drag on top and defaults to 0. Simulation playback uses **Play Every Frame**; skipping frames cannot substitute for solving them.
 
-**Contact Damping** only removes residual contact buzz slower than a tenth of sqrt(gravity x radius) (about 22 mm/s for udon). Sliding, slumping and free fall are untouched; moving colliders can still lift the pile. A dense 48-strand regression scene's RMS frame-to-frame shake (second differences) is 0.72 mm; it was 0.56 mm before revision 5, when that quiet came from freezing the pile in place.
+**Contact Damping** lets a heap come to rest. A position-based contact solve never balances forces exactly, so a heap in which every strand is held still trades a few mm/s back and forth. That residual has no direction, real motion does: each point keeps a running mean of its displacement over 0.3 s, and a point resting on other noodles whose mean drift is slower than 0.2 x sqrt(gravity x radius) (44 mm/s for udon) is held still. A point sliding on a floor or collider faster than its friction allows is never held, so Coulomb sliding starts and runs normally; free fall and moving colliders are untouched. 0 disables it.
 
 ## Physics model
 
-Solver revision 5 was rebuilt for weight. Each substep integrates gravity and drag, then runs **Iterations** passes of: nearest-neighbour query, noodle contact, floor and collider contact, an exact stretch solve and an exact bending solve; then velocity readback, friction, cohesion and a final non-penetration pass.
+Solver revision 5 was rebuilt for weight. Each substep integrates gravity and drag, then runs **Iterations** contact passes (nearest-neighbour queries, noodle contact, floor and collider contact, an exact stretch solve), then an exact bending solve, velocity readback, friction, cohesion, rest detection, a final non-penetration pass and plastic creep.
 
-- **Inextensible strands.** All of a strand's length constraints are solved together as one tridiagonal system (parallel cyclic reduction), so tension carries the whole weight of a hanging tail. The previous local Jacobi passes let a draped strand hang 14% longer than its length.
-- **Bending from a Young's modulus.** The constraint at each point is its offset from the midpoint of its neighbours, with compliance rho l^4 / (E r^2): a beam of modulus E, scaled correctly with radius and point spacing. It is solved exactly per strand each pass (a complex tridiagonal factorisation of the fourth-difference matrix, cached between frames). **Stiffness** maps logarithmically onto E: 0 = 10 kPa, 0.33 = 100 kPa (udon), 0.77 = 2 MPa (al dente spaghetti), 1 = 10 MPa. Bending is damped viscoelastically (relaxation time 0.03 s), so bent noodles ease into shape rather than ringing. The free-swinging bending period of a 24 cm udon strand measures 0.78 s against 0.66 s from beam theory: the bending solve runs last in each pass so that supports never leave a kink, and that ordering costs about a quarter of the stiffness.
+- **Inextensible strands.** All of a strand's length constraints are solved together as one tridiagonal system (parallel cyclic reduction), so tension carries the whole weight of a hanging tail. The previous local Jacobi passes let a draped strand hang 14% longer than its length; now it hangs within 5% (the bending solve after the passes is not followed by another length solve).
+- **Bending from a Young's modulus.** The constraint at each point is its offset from the midpoint of its neighbours, with compliance rho l^4 / (E r^2): a beam of modulus E, scaled correctly with radius and point spacing. It is solved exactly per strand once per substep (a complex tridiagonal factorisation of the fourth-difference matrix, cached between frames). **Stiffness** maps logarithmically onto E: 0 = 10 kPa, 0.33 = 100 kPa (udon), 0.77 = 2 MPa (al dente spaghetti), 1 = 10 MPa. Bending is damped viscoelastically (relaxation time 0.03 s), so bent noodles ease into shape rather than ringing.
+- **Plasticity.** Cooked dough is viscoplastic: a bend that is held sets. Each joint's rest bend creeps towards 60% of its current bend with a 0.4 s time constant, so strands lying curled in the heap keep soft curls instead of springing back into straight sticks, while the remaining 40% elasticity keeps held bends from creeping into kinks.
 - **Air drag** is quadratic and acts only across the strand: a = 0.5 rho_air Cd 2r v^2 / (rho pi r^2). A dropped udon strand falls at 9.75-9.81 m/s^2; the old 0.03-per-frame linear damping made it 8.17.
 - **Coulomb friction.** The tangential speed a contact may remove is Friction (or Collider Friction) times its normal push, summed over the passes, so friction grows with the load on it. A strand on a ceramic-like slope with friction 0.5 holds below atan(0.5) = 26.6 degrees and slides above it. Floor and collider friction also act on the substep's displacement, so nothing creeps; noodle-on-noodle friction acts on the velocity relative to the strand underneath. The previous rule removed 90% of all horizontal velocity on every substep of any contact: strands froze into loops and nests in mid-air, crept at 15 mm/s on an 18 degree slope, and barely slid on a 35 degree one.
-- **Noodle contact** pushes against the closest point on the neighbouring strand's segments rather than its nearest sample, so a strand crossing another is pushed straight up, not sideways. Touching pairs share their approach speed (no bounce). **Cohesion** is an attraction of Cohesion x gravity towards a strand within 1.8 diameters.
-- **Spawn.** Strands start as lazy horizontal meanders whose heading wanders over 7 cm of strand, centred on their root and dropped from staggered heights (up to one fill radius above Start Height), like a handful poured over a bowl. **Spawn Coil** scales the meander; 0 still gives straight upright rods (now leaning slightly rather than wiggled).
+- **Noodle contact** pushes against the closest point on the neighbouring strand's segments, not its nearest sample, so a strand crossing another is pushed straight up. Two neighbours are found per pass, by queries split by point parity so a strand's own neighbours never win them. The strand on top takes the larger share of each correction (shock propagation), so a heap's weight is carried down instead of squeezing the lower layers into each other. Touching pairs share their approach speed (no bounce). **Cohesion** is an attraction of Cohesion x gravity towards a strand within 1.8 diameters.
+- **Spawn: a portion lowered into the bowl.** With Spawn Coil above 0 each strand starts as one broad loop around the axis, and the loops are stacked as a loose coil (up to three concentric rings per level), all inside **Fill Diameter**, which is now the true outer extent of the spawn. Nothing touches at the start. The strands untangle for 0.1 s, then the portion is lowered in at up to 0.4 m/s for 1.5 s, as with tongs, rather than dropped: dropped from the top of the coil, a full serving reached the bowl at over 2 m/s and splashed strands over the rim. **Spawn Coil** scales the waviness of the loops; 0 still drops straight upright rods freely (leaning slightly).
 
-Measured with the harness behind `tests/test_realism.py` (udon unless noted; bowl = **Create Bowl Demo**, frame 160):
+Measured with the harness behind `tests/test_realism.py` (udon). Bowl = **Create Bowl Demo** (19.9 cm donburi, 36 strands), frame 160, seeds 0-3; "before" is the revision 4 solver in the same scene and strand count (its own spawn, Spawn Coil 0.3).
 
 | Metric | Before (rev 4) | After (rev 5) |
 | --- | ---: | ---: |
 | Free-fall acceleration | 8.17 m/s^2 | 9.75 m/s^2 |
-| Strand draped over a 4 mm rod: length | 114% | slips off (see limits) |
-| Strand draped over a 4 mm rod: sharpest turn between segments | 98 degrees | - |
-| Strand dropped on an 8 mm rod | slips off | hangs; length 101%, tails 9 degrees off vertical, 44 mm wide 3 cm below the top |
-| Slope, friction 0.5, 18 degrees | creeps 15 mm/s | holds (0 mm/s) |
+| Strand draped over a 4 mm rod: length / sharpest turn | 114% / 98 degrees | slips through (see Colliders) |
+| Strand dropped on an 8 mm rod | slips off | hangs: length 105%, tails 1 degree off vertical, 38 mm wide 3 cm below the top |
+| Slope, friction 0.5, 18 degrees | creeps 15 mm/s | holds |
 | Slope, friction 0.5, 35 degrees | 32 mm/s | slides off the slab |
-| Bowl: turn angle between segments, mean / 95th percentile | 33 / 96 degrees | 17 / 44 degrees |
-| Bowl: joints sharper than 60 degrees | 14% | 1.5% |
-| Bowl: points within 1.2 diameters of support | 98% | 96% |
-| Bowl: mean height of the pile above the bowl floor | 12 mm | 17 mm |
-| Bowl: RMS speed over frames 120-160 / RMS shake | 16 mm/s / 0.64 mm | 21 mm/s / 0.65 mm |
-| Bowl: points outside the bowl | 2% | 12% |
-| Bowl: solver time per frame (same loaded 4-core machine) | 117 ms | 220-275 ms |
+| Bowl: turn between segments, mean / 95th percentile | 38 / 89 degrees | 16-17 / 38-41 degrees |
+| Bowl: joints sharper than 60 degrees | 19% | 0.2-0.8% |
+| Bowl: points outside the bowl | 0% | 0% |
+| Bowl: highest point above whatever is under it | 8 mm | 13-26 mm (2 L_g = 79 mm) |
+| Bowl: RMS speed over frames 120-160 | 33 mm/s | 4-8 mm/s |
+| Bowl: time per frame incl. surface (same machine, sequential) | 108 ms | 179 ms |
 
-The earlier pile was a single layer of stiff wiggles laid where the coils landed; the new one is a lower-curvature tangle a little higher in the middle, lying in curves a few centimetres across. More strands now end up outside the bowl: the meander spawn reaches past the rim at the demo's 9 cm fill diameter, and slippery strands that land on the rim slide off it.
+The revision 4 heap read like elbow macaroni: short tight U-bends frozen where the coils landed. The new one is a mounded serving of long strands lying in broad loops and folds over each other, contained in the bowl, mostly at rest a second after the portion is in.
 
 All presets now use metres. Quality presets change thickness as well as solver cost. Applying one preserves count, seed, collider assignments, and contact settings; it restores the preset's dimensions, gravity, step budget, adaptation, iterations, and surface resolution. Applying `default` restores those defaults even after a different preset.
 
@@ -174,7 +173,16 @@ Measured on this workspace's Windows machine, Blender 5.2.0 LTS, no mesh collide
 | Quality | 48 | 32.3 | 34.7 | 31.0 |
 | Balanced | 120 | 30.0 | 32.8 | 33.4 |
 
-**These figures predate solver revision 5.** The exact stretch and bending solves, per-pass contact queries and post-stabilisation roughly double the solver cost per frame (the bowl demo measured 117 ms before and 220-275 ms after on the same, heavily loaded 4-core Linux machine); expect about half the headless frame rates above until they are re-measured on the reference machine. A 24 fps timeline has 41.7 ms per frame. These measurements include the contact-stability fix, which spends more substeps on slow frames than the earlier jitter-prone version. Complex colliders, multiple piles, small radii, higher iteration counts, and viewport effects consume additional time. Reduce strand count first when the frame budget is exceeded.
+**These figures predate solver revision 5.** Re-measured on a shared 4-core Linux machine (`--bench`, same script and frames, run back to back; the default spawn is now the lowered coil):
+
+| Preset | Strands | Rev 4 mean ms/frame | Rev 5 mean ms/frame | Rev 5 p95 | Rev 5 headless frames/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Fast | 32 | 16.4 | 57.1 | 72.4 | 17.5 |
+| Balanced | 48 | 36.1 | 101.1 | 121.6 | 9.9 |
+| Quality | 48 | 43.3 | 162.5 | 210.4 | 6.2 |
+| Balanced | 120 | 47.2 | 184.4 | 295.4 | 5.4 |
+
+Revision 5 costs 1.7x (bowl demo, where the collider's distance field and the surface are shared) to 3.5x (floor-only benches) more per frame: two exact per-strand solves, two neighbour queries and contact passes, rest detection and post-stabilisation per substep. Setting **Iterations** to 1 saves about 30% at the cost of a less settled heap (bowl RMS speed about 10 mm/s instead of 4-8). A 24 fps timeline has 41.7 ms per frame. These measurements include the contact-stability fix, which spends more substeps on slow frames than the earlier jitter-prone version. Complex colliders, multiple piles, small radii, higher iteration counts, and viewport effects consume additional time. Reduce strand count first when the frame budget is exceeded.
 
 ## Step budget and collision limits
 
