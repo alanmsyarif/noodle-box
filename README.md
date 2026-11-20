@@ -1,6 +1,6 @@
 # Noodle Box for Blender
 
-An installable Blender add-on for cooked noodle piles: gravity, stretch, XPBD bending, self-contact, cohesion, floor contact, and closed-mesh colliders. Includes six noodle types, a sidebar, and a one-click bowl demo. No external packages or network access required at runtime.
+An installable Blender add-on for cooked noodle piles with real weight: true gravity, inextensible strands, bending from a Young's modulus, Coulomb friction, starch cohesion, floor contact, and closed-mesh colliders. Includes six noodle types, a sidebar, and a one-click bowl demo. No external packages or network access required at runtime.
 
 Requires **Blender 5.2+**. Tested locally with Blender 5.2.0 LTS.
 
@@ -19,14 +19,16 @@ For development, `noodle_physics.py` remains a compatibility launcher. Keep it n
 
 Choose a type in the sidebar's **Noodle library**. **Apply Type** updates dimensions, flexibility, cohesion, material, and profile shape, then restarts the selected pile. Collider assignments and seed are preserved. Turn off **Use suggested strand count** to preserve your count too.
 
-| Type | Length | Width | Profile | Suggested count |
-| --- | ---: | ---: | --- | ---: |
-| Udon | 24 cm | 10 mm | Round, pale, soft | 32 |
-| Ramen | 22 cm | 5 mm | Round, golden, firmer | 24 |
-| Spaghetti | 24 cm | 2.4 mm | Fine round pasta | 12 |
-| Soba | 20 cm | 3.6 mm | Darker matte buckwheat style | 18 |
-| Rice Ribbon | 18 cm | 10 mm | Flat, 20% thickness, flexible | 20 |
-| Fettuccine | 24 cm | 7 mm | Flat, 28% thickness, golden | 20 |
+| Type | Length | Width | Profile | Young's modulus | Drape length L_g | Friction | Suggested count |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| Udon | 24 cm | 10 mm | Round, pale, soft | 100 kPa | 39 mm | 0.30 | 32 |
+| Ramen | 22 cm | 5 mm | Round, golden, firmer | 250 kPa | 34 mm | 0.30 | 24 |
+| Spaghetti | 24 cm | 2.4 mm | Fine round pasta | 2 MPa | 41 mm | 0.25 | 12 |
+| Soba | 20 cm | 3.6 mm | Darker matte buckwheat style | 300 kPa | 29 mm | 0.35 | 18 |
+| Rice Ribbon | 18 cm | 10 mm | Flat, 20% thickness, flexible | 150 kPa | 18 mm* | 0.25 | 20 |
+| Fettuccine | 24 cm | 7 mm | Flat, 28% thickness, golden | 1 MPa | 31 mm* | 0.30 | 20 |
+
+The drape length is the elasto-gravity length L_g = (E I / (rho g A))^(1/3), with density 1050 kg/m^3: roughly the radius a strand curves over when it hangs across an edge. *Ribbons bend across their thin side, so their modulus is scaled by 4/3 x aspect^2 for the round-section solver; for Rice Ribbon that falls below the 10 kPa floor of the Stiffness range and is clamped there.
 
 These are editable, art-directed examples. Thin spaghetti and soba can require more than the 24-step runtime ceiling; the sidebar reports that limit, and their fall may be speed-clamped. Udon is the preferred live-preview starting point.
 
@@ -69,9 +71,40 @@ Two changes reduce solver cost:
 - **Adaptive Substeps** estimates the required steps from the fastest stored point velocity plus a full frame of gravity. A contact-stability minimum also limits gravity-induced movement per step to 5% of the radius. This prevents slow piles from dropping to too few steps and shaking. **Substeps** remains the maximum budget; too small a budget can still cause jitter. Disable adaptation for fixed-step comparisons.
 - Empty collider branches bypass their distance-field sampling and position updates. Assigned object and collection colliders still use the full contact solver.
 
-Damping is integrated over elapsed seconds, so changing timeline FPS no longer changes the amount of air drag over the same duration. Simulation playback uses **Play Every Frame**; skipping frames cannot substitute for solving them.
+Air drag is physical (see Physics model) and every damping term is integrated over elapsed seconds, so changing timeline FPS does not change the motion over the same duration. **Damping** adds optional extra drag on top and defaults to 0. Simulation playback uses **Play Every Frame**; skipping frames cannot substitute for solving them.
 
-**Contact Damping** suppresses low-speed contact vibrations in all directions, including vertical wobble. Its strength is adjusted for elapsed time and its velocity threshold scales with radius and gravity. It does not freeze positions or affect free fall; moving colliders can still lift the pile. Start at 1; lower it if slow contact motion feels too damped. A dense 48-strand regression scene's RMS frame-to-frame shake dropped from 2.80 mm to 0.56 mm with the stability changes.
+**Contact Damping** only removes residual contact buzz slower than a tenth of sqrt(gravity x radius) (about 22 mm/s for udon). Sliding, slumping and free fall are untouched; moving colliders can still lift the pile. A dense 48-strand regression scene's RMS frame-to-frame shake (second differences) is 0.72 mm; it was 0.56 mm before revision 5, when that quiet came from freezing the pile in place.
+
+## Physics model
+
+Solver revision 5 was rebuilt for weight. Each substep integrates gravity and drag, then runs **Iterations** passes of: nearest-neighbour query, noodle contact, floor and collider contact, an exact stretch solve and an exact bending solve; then velocity readback, friction, cohesion and a final non-penetration pass.
+
+- **Inextensible strands.** All of a strand's length constraints are solved together as one tridiagonal system (parallel cyclic reduction), so tension carries the whole weight of a hanging tail. The previous local Jacobi passes let a draped strand hang 14% longer than its length.
+- **Bending from a Young's modulus.** The constraint at each point is its offset from the midpoint of its neighbours, with compliance rho l^4 / (E r^2): a beam of modulus E, scaled correctly with radius and point spacing. It is solved exactly per strand each pass (a complex tridiagonal factorisation of the fourth-difference matrix, cached between frames). **Stiffness** maps logarithmically onto E: 0 = 10 kPa, 0.33 = 100 kPa (udon), 0.77 = 2 MPa (al dente spaghetti), 1 = 10 MPa. Bending is damped viscoelastically (relaxation time 0.03 s), so bent noodles ease into shape rather than ringing. The free-swinging bending period of a 24 cm udon strand measures 0.78 s against 0.66 s from beam theory: the bending solve runs last in each pass so that supports never leave a kink, and that ordering costs about a quarter of the stiffness.
+- **Air drag** is quadratic and acts only across the strand: a = 0.5 rho_air Cd 2r v^2 / (rho pi r^2). A dropped udon strand falls at 9.75-9.81 m/s^2; the old 0.03-per-frame linear damping made it 8.17.
+- **Coulomb friction.** The tangential speed a contact may remove is Friction (or Collider Friction) times its normal push, summed over the passes, so friction grows with the load on it. A strand on a ceramic-like slope with friction 0.5 holds below atan(0.5) = 26.6 degrees and slides above it. Floor and collider friction also act on the substep's displacement, so nothing creeps; noodle-on-noodle friction acts on the velocity relative to the strand underneath. The previous rule removed 90% of all horizontal velocity on every substep of any contact: strands froze into loops and nests in mid-air, crept at 15 mm/s on an 18 degree slope, and barely slid on a 35 degree one.
+- **Noodle contact** pushes against the closest point on the neighbouring strand's segments rather than its nearest sample, so a strand crossing another is pushed straight up, not sideways. Touching pairs share their approach speed (no bounce). **Cohesion** is an attraction of Cohesion x gravity towards a strand within 1.8 diameters.
+- **Spawn.** Strands start as lazy horizontal meanders whose heading wanders over 7 cm of strand, centred on their root and dropped from staggered heights (up to one fill radius above Start Height), like a handful poured over a bowl. **Spawn Coil** scales the meander; 0 still gives straight upright rods (now leaning slightly rather than wiggled).
+
+Measured with the harness behind `tests/test_realism.py` (udon unless noted; bowl = **Create Bowl Demo**, frame 160):
+
+| Metric | Before (rev 4) | After (rev 5) |
+| --- | ---: | ---: |
+| Free-fall acceleration | 8.17 m/s^2 | 9.75 m/s^2 |
+| Strand draped over a 4 mm rod: length | 114% | slips off (see limits) |
+| Strand draped over a 4 mm rod: sharpest turn between segments | 98 degrees | - |
+| Strand dropped on an 8 mm rod | slips off | hangs; length 101%, tails 9 degrees off vertical, 44 mm wide 3 cm below the top |
+| Slope, friction 0.5, 18 degrees | creeps 15 mm/s | holds (0 mm/s) |
+| Slope, friction 0.5, 35 degrees | 32 mm/s | slides off the slab |
+| Bowl: turn angle between segments, mean / 95th percentile | 33 / 96 degrees | 17 / 44 degrees |
+| Bowl: joints sharper than 60 degrees | 14% | 1.5% |
+| Bowl: points within 1.2 diameters of support | 98% | 96% |
+| Bowl: mean height of the pile above the bowl floor | 12 mm | 17 mm |
+| Bowl: RMS speed over frames 120-160 / RMS shake | 16 mm/s / 0.64 mm | 21 mm/s / 0.65 mm |
+| Bowl: points outside the bowl | 2% | 12% |
+| Bowl: solver time per frame (same loaded 4-core machine) | 117 ms | 220-275 ms |
+
+The earlier pile was a single layer of stiff wiggles laid where the coils landed; the new one is a lower-curvature tangle a little higher in the middle, lying in curves a few centimetres across. More strands now end up outside the bowl: the meander spawn reaches past the rim at the demo's 9 cm fill diameter, and slippery strands that land on the rim slide off it.
 
 All presets now use metres. Quality presets change thickness as well as solver cost. Applying one preserves count, seed, collider assignments, and contact settings; it restores the preset's dimensions, gravity, step budget, adaptation, iterations, and surface resolution. Applying `default` restores those defaults even after a different preset.
 
@@ -97,7 +130,7 @@ Measured on this workspace's Windows machine, Blender 5.2.0 LTS, no mesh collide
 | Quality | 48 | 32.3 | 34.7 | 31.0 |
 | Balanced | 120 | 30.0 | 32.8 | 33.4 |
 
-A 24 fps timeline has 41.7 ms per frame. These measurements include the contact-stability fix, which spends more substeps on slow frames than the earlier jitter-prone version. Complex colliders, multiple piles, small radii, higher iteration counts, and viewport effects consume additional time. Reduce strand count first when the frame budget is exceeded.
+**These figures predate solver revision 5.** The exact stretch and bending solves, per-pass contact queries and post-stabilisation roughly double the solver cost per frame (the bowl demo measured 117 ms before and 220-275 ms after on the same, heavily loaded 4-core Linux machine); expect about half the headless frame rates above until they are re-measured on the reference machine. A 24 fps timeline has 41.7 ms per frame. These measurements include the contact-stability fix, which spends more substeps on slow frames than the earlier jitter-prone version. Complex colliders, multiple piles, small radii, higher iteration counts, and viewport effects consume additional time. Reduce strand count first when the frame budget is exceeded.
 
 ## Step budget and collision limits
 
@@ -113,13 +146,13 @@ Lowering the budget too far makes the fall slow down. **Fit Step Budget** uses r
 
 Runtime limits are visible in the sliders: **24 substeps** and **12 iterations**. If the required budget exceeds 24, the sidebar warns rather than claiming the scene can run unclamped. Increase radius or lower the drop height. The estimate covers a fall from rest; externally driven fast colliders may need additional care.
 
-Self-contact uses one nearest point per sample and is approximate. Dense stacks can interpenetrate; this is not continuous collision detection. Adaptive stepping also changes constraint convergence, so a final pile need not match a fixed-step bake exactly. Use fixed steps and higher quality for repeatable comparisons.
+Self-contact resolves one neighbouring strand per point per pass (refreshed every pass) and is approximate. Dense stacks can interpenetrate slightly; this is not continuous collision detection. Adaptive stepping also changes constraint convergence, so a final pile need not match a fixed-step bake exactly. Use fixed steps and higher quality for repeatable comparisons.
 
 ## Colliders
 
 Assign a closed mesh to **Collider**, or closed meshes to **Collider Collection**. Add Solidify to an open bowl or plate. The local floor at Z = 0 remains active.
 
-**Sticky Collider** takes another collection with its own grip. Collections are joined and voxelised once per evaluated frame. Animated/deforming colliders are supported, but fast motion can cross the distance field's narrow band between frames and tunnel. Collider Friction controls sideways damping; Collider Stickiness attracts nearby strands to the surface.
+**Sticky Collider** takes another collection with its own grip. Collections are joined and voxelised once per evaluated frame. Animated/deforming colliders are supported, but fast motion can cross the distance field's narrow band between frames and tunnel. Collider Friction is the Coulomb coefficient against collider surfaces (wet glazed ceramic is about 0.2-0.3); Collider Stickiness attracts nearby strands to the surface. The distance field's voxels are one noodle radius across, so colliders thinner than about a noodle diameter are crudely resolved: a udon strand dropped across a 4 mm chopstick can be pushed through it, while an 8 mm rod holds it.
 
 ## Headless commands
 
@@ -170,7 +203,7 @@ Alternatively, install pytest in Blender's Python environment and run:
 blender --background --factory-startup --python-exit-code 1 --python-expr "import pytest; raise SystemExit(pytest.main(['tests', '-v']))"
 ```
 
-Coverage includes the original velocity-clamp regressions, metric defaults, scale invariance, adaptive versus fixed-step free fall, FPS-independent damping, self-contact, all three collider sources, complete preset restoration, safe repeated setup, sidebar operators, strict CLI parsing, settled-pile jitter, moving-collider lift, and solver upgrades. Set `NOODLE_SCRIPT=<path>` to test another revision. Tests reset the Blender scene; run them in a dedicated background process.
+Coverage includes physical realism (`tests/test_realism.py`: free fall at g, Coulomb friction on a slope, an inextensible arch-shaped drape over a rod, beam-theory bending period, smooth curves in the settled bowl pile), the original velocity-clamp regressions, metric defaults, scale invariance, adaptive versus fixed-step free fall, FPS-independent damping, self-contact, all three collider sources, complete preset restoration, safe repeated setup, sidebar operators, strict CLI parsing, settled-pile jitter, moving-collider lift, and solver upgrades. Set `NOODLE_SCRIPT=<path>` to test another revision. Tests reset the Blender scene; run them in a dedicated background process.
 
 ## Troubleshooting
 
