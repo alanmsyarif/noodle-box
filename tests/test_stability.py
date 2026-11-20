@@ -33,7 +33,12 @@ def test_settled_dense_pile_has_low_jitter(noodle):
     acceleration = np.diff(positions, n=2, axis=0)
     steps = np.linalg.norm(np.diff(positions, axis=0), axis=-1)
     assert np.sqrt(np.mean(acceleration ** 2)) < 0.0008
-    assert np.percentile(steps, 95) < 0.0018
+    # Was 1.8 mm. That pile was quiet because contact damping and a 90%
+    # per-substep velocity kill froze it in place within a few frames. With
+    # Coulomb friction it keeps slumping slowly outwards (about 9 mm of radial
+    # spread over these 60 frames), and that drift is in the step size too;
+    # the second differences above still bound the shake.
+    assert np.percentile(steps, 95) < 0.0025
     assert positions[-1, :, 2].max() > 0.012, "pile collapsed into the floor layer"
 
 
@@ -65,6 +70,7 @@ def test_old_graph_upgrade_preserves_inputs_and_other_users(noodle):
     ng["noodle_solver_revision"] = 2
     noodle.set_input(obj, ng, "Noodle Count", 7)
     noodle.set_input(obj, ng, "Noodle Radius", 0.008)
+    noodle.set_input(obj, ng, "Friction", 0.9)
     obj.location = (1, 2, 3)
     # Match an old graph's interface, which lacks the new damping control.
     socket = next(s for s in ng.interface.items_tree if s.name == "Contact Damping")
@@ -76,5 +82,9 @@ def test_old_graph_upgrade_preserves_inputs_and_other_users(noodle):
     assert tuple(obj.location) == (1, 2, 3)
     assert noodle.get_input(obj, current, "Noodle Count") == 7
     assert noodle.get_input(obj, current, "Noodle Radius") == pytest.approx(0.008)
-    assert noodle.get_input(obj, current, "Contact Damping") == 1
+    defaults = {p[0]: p[2] for p in noodle.PARAMS}
+    assert noodle.get_input(obj, current, "Contact Damping") == pytest.approx(defaults["Contact Damping"])
+    # Revision 5 gave Friction a physical (Coulomb) meaning; an old pile's
+    # velocity-kill value is replaced rather than reinterpreted.
+    assert noodle.get_input(obj, current, "Friction") == pytest.approx(defaults["Friction"])
     assert not noodle.upgrade_solver(bpy.context, obj)

@@ -76,7 +76,7 @@ from .presets import NOODLE_TYPES, TYPE_ITEMS
 NG_NAME = "Noodle Physics"
 OBJ_NAME = "NoodlePhysics"
 MAT_NAME = "Noodle"
-SOLVER_REVISION = 4
+SOLVER_REVISION = 5
 
 # Interactive startup preset. All presets use metres; None uses PARAMS.
 PRESET = "balanced"
@@ -90,6 +90,26 @@ ATTR_BDLAM = "np_bdlam"    # its change this iteration, shared with the neighbou
 ATTR_LEN = "np_len"        # this noodle's own length, once Length Variation applies
 ATTR_ROOT = "np_root"      # where this noodle was spawned on the disc
 ATTR_CDIST = "np_cdist"    # signed distance to the collider, from the SDF
+ATTR_CNRM = "np_cnrm"      # outward normal of the nearest collider surface
+ATTR_SPUSH = "np_spush"    # this substep's contact push from the floor and colliders
+ATTR_NPUSH = "np_npush"    # this substep's contact push from other noodles
+ATTR_SFRIC = "np_sfric"    # this substep's floor/collider friction, as a displacement
+ATTR_SDIR = "np_sdir"      # unit direction of the segment ending at this point
+ATTR_SABC = "np_sabc"      # tridiagonal row (a, b, c) of the stretch solve
+ATTR_SD = "np_sd"          # right-hand side, then multiplier, of the stretch solve
+# Bending solve: tridiagonal rows, unit solves, capacitance and work vectors.
+ATTR_BEND_AC = "np_bac"
+ATTR_BEND_B = "np_bb"
+ATTR_BEND_E = "np_be"
+ATTR_BEND_Y = "np_by"
+ATTR_BEND_S = "np_bs"
+ATTR_BEND_DRE = "np_bdre"
+ATTR_BEND_DIM = "np_bdim"
+ATTR_BEND_TMP_E = "np_btmpe"
+ATTR_BEND_TMP_AC = "np_btmpac"
+ATTR_BEND_TMP_B = "np_btmpb"
+ATTR_BEND_LEVEL = "np_bk"  # + round number: that round's elimination factors
+ATTR_BEND_KEY = "np_bkey"  # the compliance the stored factorisation was built for
 
 # The collider is read as a signed distance field, voxelised once a frame.
 # Voxel size is a fraction of the noodle radius; Band Width is how many voxels
@@ -104,7 +124,12 @@ SDF_BAND = 6
 # vertex of the tube, interpolated, for data nothing downstream reads. Stripped
 # before the surface; np_id and np_vel are deliberately kept, because they are
 # genuinely useful in a shader.
-SCRATCH_ATTRS = (ATTR_PREV, ATTR_NEAR, ATTR_CDIST,
+SCRATCH_ATTRS = (ATTR_PREV, ATTR_NEAR, ATTR_CDIST, ATTR_CNRM, ATTR_SPUSH, ATTR_NPUSH, ATTR_SFRIC,
+                 ATTR_SDIR, ATTR_SABC, ATTR_SD,
+                 ATTR_BEND_AC, ATTR_BEND_B, ATTR_BEND_E, ATTR_BEND_Y, ATTR_BEND_S,
+                 ATTR_BEND_DRE, ATTR_BEND_DIM, ATTR_BEND_TMP_E, ATTR_BEND_TMP_AC,
+                 ATTR_BEND_TMP_B, ATTR_BEND_KEY,
+                 *(ATTR_BEND_LEVEL + str(level) for level in range(12)),
                  ATTR_BLAM, ATTR_BDLAM, ATTR_LEN, ATTR_ROOT)
 
 # How far past touching cooked pasta still clings, as a multiple of diameter.
@@ -136,29 +161,68 @@ MAX_RUNTIME_ITERATIONS = 12
 LAUNCH_LIMIT = 1.5
 
 
-# Turn rate of the spawn coil. A noodle held upright would buckle instantly, so
-# it is spawned already coiled rather than as a rigid vertical rod.
-COIL_SCALE = 0.18
+# Spawn shape: strands start as lazy horizontal meanders (see build_group).
+SPAWN_WAVE = 0.07   # m of strand over which the heading wanders
+SPAWN_TURN = 6.0    # radians of heading per unit of noise, at Spawn Coil 1
+SPAWN_TILT = 0.3    # vertical wobble of the meander, as a slope
+SPAWN_STACK = 1.0   # strands start up to this many fill radii above Start Height
 
-# Compliance at Stiffness 0.5. Inverse masses here are 1 rather than 1/kg, so
-# alpha/dt^2 comes out dimensionless and this number does not depend on the
-# scene's length unit - only on how large the noodle is relative to gravity.
-# Lowering it "for scale" once made the whole Stiffness range rigid, which
-# showed up as the knob having no measurable effect at all.
-BEND_COMPLIANCE = 4.0e-5
+# ------------------------------------------------------------ material model
+# Cooked wheat noodles are about as dense as water with a little starch in it.
+NOODLE_DENSITY = 1050.0  # kg/m^3
+
+# Stiffness 0..1 maps logarithmically onto Young's modulus between these, so
+# the slider reads evenly from overcooked to barely cooked. Measured cooked
+# noodles sit around 50-300 kPa (udon, ramen) up to a few MPa (al dente
+# spaghetti). Each noodle type stores its modulus and converts with
+# stiffness_for_modulus().
+YOUNG_MIN = 10.0e3   # Pa, Stiffness 0
+YOUNG_MAX = 10.0e6   # Pa, Stiffness 1
+
+# Quadratic air drag across a strand, a = AIR_DRAG / radius * |v|^2, from
+# 0.5 * rho_air * Cd * (2 r) / (rho * pi * r^2) with rho_air 1.2 and Cd 1.2.
+AIR_DRAG = 0.5 * 1.2 * 1.2 * 2.0 / (NOODLE_DENSITY * 3.141592653589793)
+
+# Viscoelastic relaxation time of bending, in seconds: cooked dough is lossy,
+# so a bent strand eases into shape instead of springing back and ringing.
+BEND_RELAXATION = 0.03
+
+
+# Adaptive substeps keep a resting point's per-step gravity sag below this
+# fraction of the radius.
+SAG_FRACTION = 0.05
+
+# Sockets whose meaning changed in solver revision 5; upgrades reset them.
+REVISION_5_PHYSICS = ("Damping", "Contact Damping", "Stiffness", "Friction")
+
+# Default for the Contact Damping socket.
+DEFAULT_CONTACT_DAMPING = 1.0
+
+# Contact Damping only acts below this fraction of sqrt(g r): sub-millimetre
+# buzz, not slumping or sliding.
+SETTLE_FRACTION = 0.1
 
 # Contact skin, as a fraction of the radius. Anything a point comes this close
 # to counts as touching, for friction purposes.
 CONTACT_SKIN = 1.2
 
 
-# Under-relaxation for the bend solve. Points are solved in parallel, so each
-# one receives corrections from its own triple and from both neighbouring
-# triples at once; at full strength that overshoots and diverges - at
-# Stiffness 0.9 the mean turn angle came out at 89 degrees, near-random, and
-# raising stiffness made it worse rather than better. Scaling the multiplier
-# step slows convergence without moving the solution it converges to.
-JACOBI_RELAX = 0.3
+def modulus_for_stiffness(stiffness):
+    """Young's modulus in pascals for a Stiffness value."""
+    stiffness = min(max(stiffness, 0.0), 1.0)
+    return YOUNG_MIN * (YOUNG_MAX / YOUNG_MIN) ** stiffness
+
+
+def stiffness_for_modulus(modulus):
+    """Stiffness value for a Young's modulus in pascals (clamped to 0..1)."""
+    from math import log
+    return min(max(log(modulus / YOUNG_MIN) / log(YOUNG_MAX / YOUNG_MIN), 0.0), 1.0)
+
+
+def elastogravity_length(modulus, radius, gravity=9.81, density=NOODLE_DENSITY):
+    """L_g = (E I / (rho g A))^(1/3) for a round strand: the bend radius of a drape."""
+    return (modulus * radius * radius / (4.0 * density * gravity)) ** (1.0 / 3.0)
+
 
 NOODLE_SPREAD = 51.7   # noise-space gap between noodles, for the start jitter
 
@@ -179,19 +243,19 @@ PARAMS = [
     ("Collider",        "NodeSocketObject", None,  None,  None,   None),
     ("Collider Collection", "NodeSocketCollection", None, None, None, None),
     ("Collider Margin", "NodeSocketFloat", 0.0,    0.0,   1e6,    "DISTANCE"),
-    ("Collider Friction","NodeSocketFloat", 0.5,   0.0,   1.0,    "FACTOR"),
+    ("Collider Friction","NodeSocketFloat", 0.3,   0.0,   1.0,    "FACTOR"),
     ("Collider Stickiness","NodeSocketFloat", 0.0,  0.0,   1.0,    "FACTOR"),
     ("Sticky Collider", "NodeSocketCollection", None, None, None,   None),
     ("Sticky Collider Grip","NodeSocketFloat", 0.8,  0.0,   1.0,    "FACTOR"),
     ("Start Height",    "NodeSocketFloat", 0.12,   0.0,   100.0,  "DISTANCE"),
     ("Gravity",         "NodeSocketFloat", 9.81,   0.0,   1e6,    None),
-    ("Damping",         "NodeSocketFloat", 0.03,   0.0,   1.0,    "FACTOR"),
-    ("Contact Damping", "NodeSocketFloat", 1.0,    0.0,   1.0,    "FACTOR"),
-    ("Stiffness",       "NodeSocketFloat", 0.5,    0.0,   1.0,    "FACTOR"),
+    ("Damping",         "NodeSocketFloat", 0.0,    0.0,   1.0,    "FACTOR"),
+    ("Contact Damping", "NodeSocketFloat", DEFAULT_CONTACT_DAMPING, 0.0, 1.0, "FACTOR"),
+    ("Stiffness",       "NodeSocketFloat", 0.333,  0.0,   1.0,    "FACTOR"),
     ("Substeps",        "NodeSocketInt",   14,     1,     MAX_RUNTIME_SUBSTEPS, None),
     ("Adaptive Substeps", "NodeSocketBool", True,  None,  None,   None),
     ("Iterations",      "NodeSocketInt",   2,      1,     MAX_RUNTIME_ITERATIONS, None),
-    ("Friction",        "NodeSocketFloat", 0.9,    0.0,   1.0,    "FACTOR"),
+    ("Friction",        "NodeSocketFloat", 0.3,    0.0,   1.0,    "FACTOR"),
     ("Self Collision",  "NodeSocketFloat", 1.0,    0.0,   1.0,    "FACTOR"),
     ("Cohesion",        "NodeSocketFloat", 0.15,   0.0,   1.0,    "FACTOR"),
 ]
@@ -220,22 +284,22 @@ DESCRIPTIONS = {
     "Noodle Material": "Surface material for this pile; noodle type presets supply their own colours",
     "Fill Diameter": "Diameter of the spawn disc in metres",
     "Start Height": "Spawn origin above the local floor in metres; coils can extend below this",
-    "Spawn Coil": "1 starts loose coils; 0 starts upright strands",
+    "Spawn Coil": "How much each strand meanders when dropped: 1 lazy curves, 0 upright straight rods",
     "Seed": "Repeatable random layout and strand lengths",
     "Gravity": "Downward acceleration in metres per second squared; Earth gravity is 9.81",
-    "Damping": "Air drag fraction per 1/24 second, adjusted for scene FPS and substeps",
-    "Contact Damping": "Suppress small vibrations at contacts; 0 disables, 1 strongest. Free fall is unaffected",
-    "Stiffness": "XPBD bending resistance: 0 flexible, 1 rigid",
+    "Damping": "Extra air drag per 1/24 second on top of the physical drag every noodle feels; 0 falls at true gravity",
+    "Contact Damping": "Settle residual contact buzz below a tenth of sqrt(gravity x radius); sliding, slumping and free fall are unaffected",
+    "Stiffness": "Bending stiffness as Young's modulus on a log scale: 0 = 10 kPa (overcooked), 0.33 = 100 kPa (udon), 0.77 = 2 MPa (al dente), 1 = 10 MPa",
     "Adaptive Substeps": "Use current maximum speed plus gravity to spend fewer substeps on slow frames",
     "Substeps": "Maximum steps per frame (1 to 24). Too few clamp fall speed. Use Fit Step Budget after changing scale or FPS",
-    "Iterations": "Constraint passes per substep (1 to 12); start with 2",
+    "Iterations": "Constraint passes per substep (1 to 12). Stretch and bending are solved exactly in each pass; 2 is plenty",
     "Self Collision": "Noodle contact strength; 0 allows strands to pass through one another",
-    "Friction": "Sideways contact friction against noodles and the floor",
-    "Cohesion": "Attraction between nearby strands; 0 is dry, higher values clump",
+    "Friction": "Coulomb friction coefficient between noodles and on the floor; a strand holds on slopes below atan(Friction). Wet pasta is about 0.2-0.4",
+    "Cohesion": "Starch stickiness: pull towards a strand within 1.8 diameters, as a fraction of gravity; 0 is dry",
     "Collider": "Closed mesh collider. Add thickness to open bowls with Solidify. The local floor remains active",
     "Collider Collection": "Additional closed meshes, joined into one distance field per frame",
     "Collider Margin": "Extra clearance from collider surfaces in metres",
-    "Collider Friction": "Sideways friction against collider surfaces",
+    "Collider Friction": "Coulomb friction coefficient against colliders; wet glazed ceramic is about 0.2-0.3",
     "Collider Stickiness": "Attraction to nearby collider surfaces",
     "Sticky Collider": "Second collider collection with independent grip; adds a second distance field",
     "Sticky Collider Grip": "Attraction to the sticky collection surfaces",
@@ -485,11 +549,20 @@ def build_group():
               2.0, 12, 6))
 
     # Spawn shape. A rigid vertical rod is not what a cooked noodle does: held
-    # up by one end it buckles immediately. So the default is an already-coiled
-    # noodle, built by the same accumulated-noise walk the procedural generator
-    # uses - correlated turns rather than jitter. Spawn Coil 0 gives back the
-    # old straight rod, which still needs a nudge to break its symmetry or it
-    # falls perfectly vertically and stacks like a pole.
+    # up by one end it buckles immediately. Nor is a tight coil: cooked
+    # noodles are heavy and limp, and a strand lifted from the pot and let go
+    # lies in long lazy curves, not loops. So each strand starts as a gently
+    # meandering, nearly horizontal line - its heading wanders with a
+    # correlation length of SPAWN_WAVE metres of strand, so its curves are a
+    # few centimetres across whatever the point spacing - centred on its root
+    # and dropped from its own height, so a handful poured over a bowl lands
+    # strand on strand rather than all at once. Tight coils also stored
+    # bending energy that, once the bending was solved properly, sprang the
+    # strands straight and out of the bowl.
+    #
+    # Spawn Coil scales the meander; 0 gives back the old straight upright rod,
+    # which still needs a nudge to break its symmetry or it falls perfectly
+    # vertically and stacks like a pole.
     nid_setup = named(ATTR_ID, "INT", 13, 3)
     len_setup = named(ATTR_LEN, "FLOAT", 13, 5)
     rest_setup = math("DIVIDE", len_setup,
@@ -498,31 +571,64 @@ def build_group():
                                 nd("GeometryNodeSplineLength", 13, 6).outputs["Point Count"],
                                 1.0, 14, 6), 1.0, 15, 6), 14, 5)
     spline_i_setup = nd("GeometryNodeSplineParameter", 13, 4).outputs["Index"]
+    arc = math("MULTIPLY", spline_i_setup, rest_setup, 14, 2)
     coil_noise = nd("ShaderNodeTexNoise", 15, 3, noise_dimensions="3D")
     plug(coil_noise.inputs["Vector"], xyz(
-        math("MULTIPLY", spline_i_setup, COIL_SCALE, 14, 3),
+        math("DIVIDE", arc, SPAWN_WAVE, 14, 3),
         math("MULTIPLY", nid_setup, NOODLE_SPREAD, 14, 4),
-        0.0, 14, 6))
+        P["Seed"], 14, 6))
     plug(coil_noise.inputs["Scale"], 1.0)
+    plug(coil_noise.inputs["Detail"], 0.0)
     cx, cy, cz = sep(vmath("SUBTRACT", coil_noise.outputs["Color"], (0.5, 0.5, 0.5), 16, 3), 17, 3)
-    # Flatten the walk so a spawned noodle is a loose nest, not a tangled ball.
+    # Heading: a random start per strand plus the wandering noise.
+    strand_noise = nd("ShaderNodeTexWhiteNoise", 15, 7, noise_dimensions="2D")
+    plug(strand_noise.inputs["Vector"], xyz(nid_setup, P["Seed"], 0.0, 14, 7))
+    s_head, s_lift, _ = sep(strand_noise.outputs["Color"], 16, 7)
+    heading = math("ADD", math("MULTIPLY", s_head, tau, 17, 7),
+                   math("MULTIPLY", math("MULTIPLY", cx, SPAWN_TURN, 17, 8), P["Spawn Coil"], 18, 8),
+                   18, 7)
     coil_step = vmath("SCALE",
-                      vmath("NORMALIZE", xyz(cx, cy, math("MULTIPLY", cz, 0.35, 18, 4), 18, 3),
-                            None, 19, 3),
-                      rest_setup, 20, 3)
+                      vmath("NORMALIZE",
+                            xyz(math("COSINE", heading, None, 19, 7), math("SINE", heading, None, 19, 8),
+                                math("MULTIPLY", cz, SPAWN_TILT, 19, 9), 20, 7), None, 21, 7),
+                      rest_setup, 22, 7)
     coil_acc = nd("GeometryNodeAccumulateField", 21, 3,
                   data_type="FLOAT_VECTOR", domain="POINT")
     plug(coil_acc.inputs["Value"], coil_step)
     plug(coil_acc.inputs["Group ID"], nid_setup)
+    coil_sum = nd("GeometryNodeAccumulateField", 22, 3,
+                  data_type="FLOAT_VECTOR", domain="POINT")
+    plug(coil_sum.inputs["Value"], coil_acc.outputs["Trailing"])
+    plug(coil_sum.inputs["Group ID"], nid_setup)
+    # Centred on the root, and lifted by up to half the fill diameter so the
+    # strands arrive one after another.
+    meander = vmath("ADD",
+                    vmath("SUBTRACT", coil_acc.outputs["Trailing"],
+                          vmath("SCALE", coil_sum.outputs["Total"],
+                                math("DIVIDE", 1.0,
+                                     math("MAXIMUM",
+                                          nd("GeometryNodeSplineLength", 22, 6).outputs["Point Count"],
+                                          1.0, 23, 6), 24, 6), 23, 5), 24, 5),
+                    xyz(0.0, 0.0, math("MULTIPLY", s_lift, math("MULTIPLY", fill_r, SPAWN_STACK, 23, 8),
+                                       24, 8), 24, 7), 25, 5)
 
-    rod = xyz(math("MULTIPLY", cx, P["Noodle Radius"], 17, 6),
-              math("MULTIPLY", cy, P["Noodle Radius"], 17, 7),
-              math("MULTIPLY", spline_i_setup, rest_setup, 17, 8), 18, 7)
-    spawn = mix_vec(P["Spawn Coil"], rod, coil_acc.outputs["Trailing"], 22, 4)
+    # The rod is straight but leans by up to 1 in 50, so a symmetric drop
+    # still topples. A straight lean, not a wiggle: with the bending solved
+    # stiffly, a wiggled rod was kicked straight on its first step.
+    rod = xyz(math("MULTIPLY", arc, math("MULTIPLY", math("SUBTRACT", s_head, 0.5, 16, 10), 0.04, 16, 11),
+                   17, 10),
+              math("MULTIPLY", arc, math("MULTIPLY", math("SUBTRACT", s_lift, 0.5, 16, 12), 0.04, 16, 13),
+                   17, 11),
+              arc, 18, 10)
+    spawn = mix_vec(math("MINIMUM", math("MULTIPLY", P["Spawn Coil"], 1e3, 20, 11), 1.0, 21, 11),
+                    rod, meander, 22, 10)
 
     # Position is rebuilt from scratch rather than offset, so the instanced
     # line's own shape does not survive into the spawn.
     start = nd("GeometryNodeSetPosition", 24, 1)
+    # Named so measurement fixtures can replace the spawn shape (the drape
+    # test lays a single straight strand across a rod).
+    start.name = start.label = "Spawn Position"
     plug(start.inputs["Geometry"], resample.outputs["Curve"])
     plug(start.inputs["Position"],
          vmath("ADD",
@@ -551,6 +657,13 @@ def build_group():
     # fall. Substeps buy back the speed: the cap scales
     # with the substep count, so 8 substeps means 8x the fall speed at the
     # same collision accuracy, for 8x the solve.
+    # Rounds of cyclic reduction the stretch solve needs: log2 of the longest
+    # strand's point count. Constant for a run, so measured once a frame.
+    longest = nd("GeometryNodeAttributeStatistic", 17, 15, data_type="FLOAT", domain="POINT")
+    plug(longest.inputs["Geometry"], state)
+    plug(longest.inputs["Attribute"], nd("GeometryNodeSplineLength", 16, 15).outputs["Point Count"])
+    pcr_rounds = math("CEIL", math("LOGARITHM", math("MAXIMUM", longest.outputs["Max"], 2.0, 18, 15),
+                                   2.0, 19, 15), None, 20, 15)
     sub_in = nd("GeometryNodeRepeatInput", 20, 2)
     sub_out = nd("GeometryNodeRepeatOutput", 78, 1)
     sub_in.pair_with_output(sub_out)
@@ -577,7 +690,7 @@ def build_group():
     sag_steps = math("CEIL", math("SQRT", math("DIVIDE",
                     math("MULTIPLY", P["Gravity"],
                          math("MULTIPLY", frame_dt, frame_dt, 16, 13), 17, 13),
-                    math("MULTIPLY", P["Noodle Radius"], 0.05, 17, 14), 18, 13),
+                    math("MULTIPLY", P["Noodle Radius"], SAG_FRACTION, 17, 14), 18, 13),
                     None, 18, 14), None, 19, 14)
     adaptive = math("MINIMUM", runtime_substeps,
                     math("MAXIMUM", needed,
@@ -588,8 +701,6 @@ def build_group():
     plug(step_switch.inputs["True"], adaptive)
     runtime_substeps = step_switch.outputs["Output"]
     plug(sub_in.inputs["Iterations"], runtime_substeps)
-    plug(sub_in.inputs["Geometry"], state)
-    state = sub_in.outputs["Geometry"]
     substeps = math("MAXIMUM", runtime_substeps, 1.0, 20, 8)
     dt = math("DIVIDE", frame_dt, substeps, 21, 8)
     # Per noodle, not global: Length Variation means every strand has its own
@@ -602,6 +713,231 @@ def build_group():
                           nd("GeometryNodeSplineLength", 21, 7).outputs["Point Count"],
                           1.0, 22, 7), 1.0, 23, 7), 22, 6)
 
+    spline_i = nd("GeometryNodeSplineParameter", 35, 4).outputs["Index"]
+    point_count = nd("GeometryNodeSplineLength", 35, 5).outputs["Point Count"]
+    has_prev = math("GREATER_THAN", spline_i, 0.5, 36, 4)
+    has_prev2_row = math("GREATER_THAN", spline_i, 1.5, 36, 3)
+    has_next = math("LESS_THAN", spline_i, math("SUBTRACT", point_count, 1.5, 36, 5), 37, 5)
+    prev_p = at_index(position, math("SUBTRACT", index, 1, 36, 6), "FLOAT_VECTOR", 37, 6)
+    next_p = at_index(position, math("ADD", index, 1, 36, 9), "FLOAT_VECTOR", 37, 9)
+    interior = math("MULTIPLY", has_prev, has_next, 38, 3)
+
+    # ------------------------------------------- bending solve, set-up per frame
+    # Bending is solved directly, not iterated - see "bending stiffness" in
+    # the constraint loop for why. The matrix it needs depends only on each
+    # strand's point count, rest length and compliance, so its factorisation
+    # is done once a frame, here, and the loop only replays it.
+    #
+    # Each interior point carries one vector constraint, C = p - midpoint of
+    # its neighbours. XPBD needs (J J^T + a I) dlambda = r, with a = alpha /
+    # dt^2; J J^T is the truncated pentadiagonal Toeplitz matrix
+    # (1, -4, 6, -4, 1) / 4, a fourth difference. Away from the two end rows
+    # that is exactly L^2 / 4 for the tridiagonal second difference L, and
+    # a I + L^2 / 4 = a (I + i g L)(I - i g L) with g = 1 / (2 sqrt a), so its
+    # inverse applied to a real vector is Re[(I + i g L)^-1 r] / a: one complex
+    # tridiagonal solve. Parallel cyclic reduction does that solve with every
+    # point working at once in ceil(log2(points)) rounds. The two end rows,
+    # where J J^T and L^2 / 4 differ by 1/4 on the diagonal, are corrected
+    # exactly with the Sherman-Morrison-Woodbury identity, using two more
+    # solves (for unit vectors at the first and last row) that also depend
+    # only on the strand, so they are done here too.
+    def cmul(ar, ai, br, bi, col, row):
+        """(ar + i ai)(br + i bi) for scalar fields."""
+        return (math("SUBTRACT", math("MULTIPLY", ar, br, col, row),
+                     math("MULTIPLY", ai, bi, col, row + 1), col + 1, row),
+                math("ADD", math("MULTIPLY", ar, bi, col, row + 2),
+                     math("MULTIPLY", ai, br, col, row + 3), col + 1, row + 2))
+
+    def cdiv(ar, ai, br, bi, col, row):
+        """(ar + i ai) / (br + i bi) for scalar fields."""
+        den = math("ADD", math("MULTIPLY", br, br, col, row + 4),
+                   math("MULTIPLY", bi, bi, col, row + 5), col + 1, row + 4)
+        re, im = cmul(ar, ai, br, math("MULTIPLY", bi, -1.0, col, row + 6), col + 1, row)
+        return (math("DIVIDE", re, den, col + 2, row), math("DIVIDE", im, den, col + 2, row + 1))
+
+    def colour_store(geo, name, r, g, b, a, col, row):
+        n = nd("FunctionNodeCombineColor", col, row, mode="RGB")
+        for socket, value in zip(("Red", "Green", "Blue", "Alpha"), (r, g, b, a)):
+            plug(n.inputs[socket], value)
+        return store(geo, name, n.outputs["Color"], "FLOAT_COLOR", col + 1, row)
+
+    def colour_read(source, col, row):
+        n = nd("FunctionNodeSeparateColor", col, row, mode="RGB")
+        plug(n.inputs["Color"], source)
+        return n.outputs["Red"], n.outputs["Green"], n.outputs["Blue"], n.outputs["Alpha"]
+
+    def gated_colour(ok, source, col, row):
+        """A neighbour's four values, or zeros where it is off the strand."""
+        return tuple(math("MULTIPLY", v, ok, col + 1, row + k)
+                     for k, v in enumerate(colour_read(source, col, row)))
+
+    def level_name(level, col, row):
+        text = nd("FunctionNodeValueToString", col, row)
+        plug(text.inputs["Value"], level)
+        join = nd("GeometryNodeStringJoin", col + 1, row)
+        prefix = nd("FunctionNodeInputString", col, row + 1)
+        prefix.string = ATTR_BEND_LEVEL
+        # Multi-input sockets list the newest link first.
+        links.new(text.outputs["String"], join.inputs["Strings"])
+        links.new(prefix.outputs["String"], join.inputs["Strings"])
+        return join.outputs["String"]
+
+    # Compliance alpha = rho l^4 / (E r^2); see the constraint loop.
+    modulus = math("MULTIPLY", YOUNG_MIN,
+                   math("POWER", YOUNG_MAX / YOUNG_MIN,
+                        math("MINIMUM", math("MAXIMUM", P["Stiffness"], 0.0, 2, 20),
+                             1.0, 3, 20), 4, 20), 5, 20)
+    rest2 = math("MULTIPLY", rest, rest, 2, 21)
+    alpha = math("DIVIDE",
+                 math("MULTIPLY", NOODLE_DENSITY, math("MULTIPLY", rest2, rest2, 3, 21), 4, 21),
+                 math("MULTIPLY", modulus,
+                      math("MULTIPLY", P["Noodle Radius"], P["Noodle Radius"], 3, 22),
+                      4, 22), 5, 21)
+    # A floor on a keeps g finite; 1e-6 is already far stiffer than any
+    # cooked noodle at any substep count this solver allows.
+    alpha_dt = math("MAXIMUM",
+                    math("DIVIDE", alpha, math("MAXIMUM", math("MULTIPLY", dt, dt, 5, 22),
+                                               1e-12, 6, 22), 6, 21), 1e-6, 7, 21)
+    # Viscoelastic damping of bending (Kelvin-Voigt: stress follows strain
+    # plus BEND_RELAXATION times its rate), XPBD's constraint damping with
+    # gamma = tau / dt. It only resists changes of shape, so a falling or
+    # sliding noodle is untouched, while a bent one eases back instead of
+    # ringing like a wire. It folds into the same matrix with a scaled
+    # compliance: ((1 + gamma) J J^T + a) = (1 + gamma)(J J^T + a / (1 + gamma)).
+    bend_gamma = math("DIVIDE", BEND_RELAXATION, math("MAXIMUM", dt, 1e-9, 6, 25), 7, 25)
+    bend_scale = math("DIVIDE", 1.0, math("ADD", 1.0, bend_gamma, 8, 25), 9, 25)
+    alpha_hat = math("MAXIMUM", math("MULTIPLY", alpha_dt, bend_scale, 9, 26), 1e-6, 10, 26)
+    g_c = math("DIVIDE", 0.5, math("SQRT", alpha_hat, None, 7, 22), 8, 21)
+    first_row = math("COMPARE", spline_i, 1.0, 6, 23)
+    last_row = math("COMPARE", spline_i, math("SUBTRACT", point_count, 2.0, 5, 24), 6, 24)
+    lo_row = math("MULTIPLY", interior, math("GREATER_THAN", spline_i, 1.5, 7, 23), 8, 23)
+    hi_row = math("MULTIPLY", interior,
+                  math("LESS_THAN", spline_i, math("SUBTRACT", point_count, 2.5, 7, 24), 8, 24), 9, 24)
+    off_im = math("MULTIPLY", g_c, -1.0, 9, 21)
+    # The factorisation only changes when the step length or a strand's
+    # compliance does - with adaptive substeps, now and then - so it is kept in
+    # the simulation state and redone only when its key no longer matches.
+    # The switch is lazy: on a matching frame none of it runs.
+    cached = state
+    key_field = named(ATTR_BEND_KEY, "FLOAT", 9, 30)
+    stale_stat = nd("GeometryNodeAttributeStatistic", 11, 30, data_type="FLOAT", domain="POINT")
+    plug(stale_stat.inputs["Geometry"], state)
+    plug(stale_stat.inputs["Attribute"],
+         math("GREATER_THAN",
+              math("ABSOLUTE", math("SUBTRACT", alpha_hat, key_field, 10, 31), None, 10, 32),
+              math("MULTIPLY", alpha_hat, 1e-5, 10, 33), 11, 31))
+    stale = math("GREATER_THAN", stale_stat.outputs["Max"], 0.5, 12, 30)
+    # Rows: a and c (coupling down and up the strand) in one colour, b in a
+    # vector, the two unit right-hand sides in another colour.
+    state = colour_store(state, ATTR_BEND_AC, 0.0, math("MULTIPLY", off_im, lo_row, 10, 22),
+                         0.0, math("MULTIPLY", off_im, hi_row, 10, 23), 10, 21)
+    state = store(state, ATTR_BEND_B,
+                  xyz(1.0, math("MULTIPLY", math("MULTIPLY", g_c, 2.0, 11, 22), interior, 12, 22),
+                      0.0, 12, 21), "FLOAT_VECTOR", 13, 21)
+    state = colour_store(state, ATTR_BEND_E, math("MULTIPLY", first_row, interior, 13, 22), 0.0,
+                         math("MULTIPLY", last_row, interior, 13, 23), 0.0, 14, 21)
+
+    fac_in = nd("GeometryNodeRepeatInput", 15, 20)
+    fac_out = nd("GeometryNodeRepeatOutput", 30, 20)
+    fac_in.pair_with_output(fac_out)
+    plug(fac_in.inputs["Iterations"], pcr_rounds)
+    plug(fac_in.inputs["Geometry"], state)
+    stride = math("POWER", 2.0, fac_in.outputs["Iteration"], 15, 21)
+    lo_ok = math("GREATER_THAN", math("SUBTRACT", spline_i, stride, 16, 21), -0.5, 17, 21)
+    hi_ok = math("LESS_THAN", math("ADD", spline_i, stride, 16, 22),
+                 math("SUBTRACT", point_count, 0.5, 16, 23), 17, 22)
+    lo_i = math("SUBTRACT", index, stride, 16, 24)
+    hi_i = math("ADD", index, stride, 16, 25)
+    ac = named(ATTR_BEND_AC, "FLOAT_COLOR", 15, 26)
+    bb = named(ATTR_BEND_B, "FLOAT_VECTOR", 15, 27)
+    ee = named(ATTR_BEND_E, "FLOAT_COLOR", 15, 28)
+    ar, ai, cr, ci = colour_read(ac, 16, 26)
+    br, bi, _ = sep(bb, 16, 27)
+    e0r, e0i, e1r, e1i = colour_read(ee, 16, 28)
+    alr, ali, clr, cli = gated_colour(lo_ok, at_index(ac, lo_i, "FLOAT_COLOR", 17, 26), 18, 26)
+    ahr, ahi, chr_, chi = gated_colour(hi_ok, at_index(ac, hi_i, "FLOAT_COLOR", 17, 27), 18, 27)
+    blr, bli, _ = sep(mix_vec(lo_ok, (1.0, 0.0, 0.0), at_index(bb, lo_i, "FLOAT_VECTOR", 17, 28), 18, 28), 19, 28)
+    bhr, bhi, _ = sep(mix_vec(hi_ok, (1.0, 0.0, 0.0), at_index(bb, hi_i, "FLOAT_VECTOR", 17, 29), 18, 29), 19, 29)
+    k1r, k1i = cdiv(ar, ai, blr, bli, 20, 30)
+    k2r, k2i = cdiv(cr, ci, bhr, bhi, 20, 38)
+    # The multipliers for this round, kept for the per-iteration replay.
+    level_attr = level_name(fac_in.outputs["Iteration"], 20, 46)
+    kc = nd("FunctionNodeCombineColor", 23, 30, mode="RGB")
+    for socket, value in zip(("Red", "Green", "Blue", "Alpha"), (k1r, k1i, k2r, k2i)):
+        plug(kc.inputs[socket], value)
+    fac = store(fac_in.outputs["Geometry"], level_attr, kc.outputs["Color"], "FLOAT_COLOR", 24, 20)
+    # Same elimination applied to the two unit right-hand sides.
+    lo_e = gated_colour(lo_ok, at_index(ee, lo_i, "FLOAT_COLOR", 17, 30), 18, 30)
+    hi_e = gated_colour(hi_ok, at_index(ee, hi_i, "FLOAT_COLOR", 17, 31), 18, 31)
+    new_e = []
+    for j, (dr, di) in enumerate(((e0r, e0i), (e1r, e1i))):
+        lr, li = cmul(k1r, k1i, lo_e[2 * j], lo_e[2 * j + 1], 24, 32 + 8 * j)
+        hr, hi_ = cmul(k2r, k2i, hi_e[2 * j], hi_e[2 * j + 1], 24, 36 + 8 * j)
+        new_e += [math("SUBTRACT", dr, math("ADD", lr, hr, 26, 32 + 8 * j), 27, 32 + 8 * j),
+                  math("SUBTRACT", di, math("ADD", li, hi_, 26, 34 + 8 * j), 27, 34 + 8 * j)]
+    # New rows. Every value here was read before any of these stores.
+    t1r, t1i = cmul(clr, cli, k1r, k1i, 24, 50)
+    t2r, t2i = cmul(ahr, ahi, k2r, k2i, 24, 54)
+    new_b = xyz(math("SUBTRACT", br, math("ADD", t1r, t2r, 26, 50), 27, 50),
+                math("SUBTRACT", bi, math("ADD", t1i, t2i, 26, 51), 27, 51), 0.0, 28, 50)
+    nar, nai = cmul(alr, ali, k1r, k1i, 24, 58)
+    ncr, nci = cmul(chr_, chi, k2r, k2i, 24, 62)
+    neg = lambda v, r: math("MULTIPLY", v, -1.0, 26, r)
+    # Colours must be built from the old values, so all three are combined
+    # before the first of the three stores below runs.
+    e_col = nd("FunctionNodeCombineColor", 28, 32, mode="RGB")
+    for socket, value in zip(("Red", "Green", "Blue", "Alpha"), new_e):
+        plug(e_col.inputs[socket], value)
+    ac_col = nd("FunctionNodeCombineColor", 28, 58, mode="RGB")
+    for socket, value in zip(("Red", "Green", "Blue", "Alpha"),
+                             (neg(nar, 58), neg(nai, 59), neg(ncr, 62), neg(nci, 63))):
+        plug(ac_col.inputs[socket], value)
+    # Stores are sequential, so each one is written to a staging name first
+    # and the staged values moved over afterwards.
+    fac = store(fac, ATTR_BEND_TMP_E, e_col.outputs["Color"], "FLOAT_COLOR", 25, 20)
+    fac = store(fac, ATTR_BEND_TMP_AC, ac_col.outputs["Color"], "FLOAT_COLOR", 26, 20)
+    fac = store(fac, ATTR_BEND_TMP_B, new_b, "FLOAT_VECTOR", 27, 20)
+    fac = store(fac, ATTR_BEND_E, named(ATTR_BEND_TMP_E, "FLOAT_COLOR", 27, 22), "FLOAT_COLOR", 28, 20)
+    fac = store(fac, ATTR_BEND_AC, named(ATTR_BEND_TMP_AC, "FLOAT_COLOR", 28, 22), "FLOAT_COLOR", 29, 20)
+    fac = store(fac, ATTR_BEND_B, named(ATTR_BEND_TMP_B, "FLOAT_VECTOR", 29, 22), "FLOAT_VECTOR", 29, 21)
+    plug(fac_out.inputs["Geometry"], fac)
+    state = fac_out.outputs["Geometry"]
+
+    # Finish the two unit solves: y = Re[e / b] / a.
+    fbr, fbi, _ = sep(named(ATTR_BEND_B, "FLOAT_VECTOR", 31, 20), 32, 20)
+    f0r, f0i, f1r, f1i = colour_read(named(ATTR_BEND_E, "FLOAT_COLOR", 31, 21), 32, 21)
+    y0, _ = cdiv(f0r, f0i, fbr, fbi, 33, 20)
+    y1, _ = cdiv(f1r, f1i, fbr, fbi, 33, 28)
+    y0 = math("DIVIDE", y0, alpha_hat, 36, 20)
+    y1 = math("DIVIDE", y1, alpha_hat, 36, 21)
+    state = store(state, ATTR_BEND_Y, xyz(y0, y1, 0.0, 37, 20), "FLOAT_VECTOR", 38, 20)
+    # The 2x2 capacitance matrix 4 I + U^T Y of each strand, inverted.
+    yy = named(ATTR_BEND_Y, "FLOAT_VECTOR", 38, 22)
+    first_i = math("ADD", math("SUBTRACT", index, spline_i, 38, 23), 1.0, 39, 23)
+    last_i = math("ADD", math("SUBTRACT", index, spline_i, 38, 24),
+                  math("SUBTRACT", point_count, 2.0, 38, 25), 39, 24)
+    y0f, y1f, _ = sep(at_index(yy, first_i, "FLOAT_VECTOR", 40, 23), 41, 23)
+    y0l, y1l, _ = sep(at_index(yy, last_i, "FLOAT_VECTOR", 40, 24), 41, 24)
+    s00 = math("ADD", 4.0, y0f, 42, 23)
+    s11 = math("ADD", 4.0, y1l, 42, 24)
+    det = math("SUBTRACT", math("MULTIPLY", s00, s11, 43, 23),
+               math("MULTIPLY", y1f, y0l, 43, 24), 44, 23)
+    inv = math("DIVIDE", 1.0, det, 45, 23)
+    state = colour_store(state, ATTR_BEND_S,
+                         math("MULTIPLY", s11, inv, 46, 22),
+                         math("MULTIPLY", math("MULTIPLY", y1f, -1.0, 45, 24), inv, 46, 23),
+                         math("MULTIPLY", math("MULTIPLY", y0l, -1.0, 45, 25), inv, 46, 24),
+                         math("MULTIPLY", s00, inv, 46, 25), 47, 22)
+    state = store(state, ATTR_BEND_KEY, alpha_hat, "FLOAT", 48, 21)
+    refactor = nd("GeometryNodeSwitch", 49, 21, input_type="GEOMETRY")
+    plug(refactor.inputs["Switch"], stale)
+    plug(refactor.inputs["False"], cached)
+    plug(refactor.inputs["True"], state)
+    state = refactor.outputs["Output"]
+
+    plug(sub_in.inputs["Geometry"], state)
+    state = sub_in.outputs["Geometry"]
+
     # Keep this substep's starting positions; velocity is read back out of
     # them after the constraints have had their say.
     state = store(state, ATTR_PREV, position, "FLOAT_VECTOR", 21, 1)
@@ -610,7 +946,26 @@ def build_group():
     velocity = vmath("ADD", velocity,
                      xyz(0.0, 0.0, math("MULTIPLY", math("MULTIPLY", P["Gravity"], -1.0, 22, 4), dt, 23, 4), 23, 5),
                      24, 3)
-    # Drag is calibrated at 24 fps and integrated over seconds at any scene FPS.
+    # Air drag on a cylinder moving sideways through air, quadratic in speed:
+    # a = 0.5 rho_air Cd (2r) |v_n|^2 / (rho pi r^2). It acts only across the
+    # strand - sliding along its own axis is almost free - and it is a few
+    # percent of g at the speeds a dropped noodle reaches, so the fall is
+    # essentially free fall. Solved implicitly, v_n / (1 + k |v_n| dt), so no
+    # step size can reverse it.
+    tangent = vmath("NORMALIZE", vmath("SUBTRACT", next_p, prev_p, 22, 9), None, 23, 9)
+    v_axial = vmath("SCALE", tangent, vmath("DOT_PRODUCT", velocity, tangent, 24, 9), 25, 9)
+    v_cross = vmath("SUBTRACT", velocity, v_axial, 26, 9)
+    drag_k = math("DIVIDE", AIR_DRAG,
+                  math("MAXIMUM", P["Noodle Radius"], 1e-6, 24, 10), 25, 10)
+    v_cross = vmath("SCALE", v_cross,
+                    math("DIVIDE", 1.0,
+                         math("ADD", 1.0,
+                              math("MULTIPLY", math("MULTIPLY", drag_k, dt, 26, 10),
+                                   vmath("LENGTH", v_cross, None, 26, 11), 27, 10),
+                              28, 10), 29, 10), 30, 9)
+    velocity = vmath("ADD", v_axial, v_cross, 31, 9)
+    # Optional extra drag, calibrated at 24 fps and integrated over seconds at
+    # any scene FPS. 0 by default: the physical drag above is all a noodle sees.
     velocity = vmath("SCALE", velocity,
                      math("POWER", math("SUBTRACT", 1.0, P["Damping"], 23, 6),
                           math("MULTIPLY", dt, 24.0, 23, 7), 24, 6), 25, 3)
@@ -626,15 +981,13 @@ def build_group():
                                           math("MAXIMUM", speed, 1e-6, 27, 5), 28, 5), 1.0, 29, 5),
                      30, 3)
     state = set_position(state, vmath("ADD", position, vmath("SCALE", velocity, dt, 31, 3), 32, 3), 33, 1)
+    # Contact pushes are summed over the iterations of each substep: they are
+    # the normal impulses Coulomb friction is proportional to, and because
+    # they include the weight a contact passes on - the tension in a strand
+    # hanging off a rod, the strands piled on top - friction grows with load.
+    state = store(state, ATTR_SPUSH, 0.0, "FLOAT", 33, 2)
+    state = store(state, ATTR_NPUSH, 0.0, "FLOAT", 33, 3)
 
-    # Nearest neighbour once per substep, not once per constraint iteration.
-    # Re-querying every iteration sounds better and measured identically -
-    # 37.9% and 47.7% of points overlapping, against 37.9% and 47.8% - for
-    # 12.5x the time (186s against 15s per 150 frames). The substep loop
-    # refreshes the query on every substep.
-    nearest = nd("GeometryNodeIndexOfNearest", 33, 3)
-    plug(nearest.inputs["Position"], position)
-    state = store(state, ATTR_NEAR, nearest.outputs["Index"], "INT", 34, 1)
 
     # ------------------------------------------------------------- collider
     # An object socket and a collection socket, joined into one geometry and
@@ -722,7 +1075,7 @@ def build_group():
 
     # XPBD accumulates its multiplier across the iterations of one step, so it
     # has to start each substep at zero or the bend would keep stiffening.
-    state = store(state, ATTR_BLAM, 0.0, "FLOAT", 38, 1)
+    state = store(state, ATTR_BLAM, (0.0, 0.0, 0.0), "FLOAT_VECTOR", 38, 1)
 
     # ----------------------------------------------------- constraint solve
     rep_in = nd("GeometryNodeRepeatInput", 35, 1)
@@ -735,113 +1088,222 @@ def build_group():
     plug(rep_in.inputs["Iterations"], runtime_iterations)
     plug(rep_in.inputs["Geometry"], state)
     solve = rep_in.outputs["Geometry"]
+    # Nearest neighbour once per constraint iteration. Each point resolves
+    # only one contact at a time, so in a dense pile a point touching three
+    # strands needs the query refreshed to get to the others; once per substep
+    # left the overlaps it skipped to be pushed out a substep later, and the
+    # settled pile in the bowl jittered 30% more. For a few thousand points
+    # the query costs about as much as one stretch solve.
+    near_it = nd("GeometryNodeIndexOfNearest", 36, 6)
+    plug(near_it.inputs["Position"], position)
+    solve = store(solve, ATTR_NEAR, near_it.outputs["Index"], "INT", 36, 0)
 
-    # -- keep consecutive points one rest length apart.
-    # Jacobi style: both ends of a segment move half the error. Gauss-Seidel
-    # would converge faster but the points are solved in parallel, so it is
-    # not available; more Iterations is the knob instead.
-    spline_i = nd("GeometryNodeSplineParameter", 35, 4).outputs["Index"]
-    point_count = nd("GeometryNodeSplineLength", 35, 5).outputs["Point Count"]
-    has_prev = math("GREATER_THAN", spline_i, 0.5, 36, 4)
-    has_next = math("LESS_THAN", spline_i, math("SUBTRACT", point_count, 1.5, 36, 5), 37, 5)
-
-    prev_p = at_index(position, math("SUBTRACT", index, 1, 36, 6), "FLOAT_VECTOR", 37, 6)
-    next_p = at_index(position, math("ADD", index, 1, 36, 9), "FLOAT_VECTOR", 37, 9)
-
-    def pull(neighbour_pos, gate, col, row):
-        """Half of the correction that puts this point at rest length."""
-        delta = vmath("SUBTRACT", position, neighbour_pos, col, row)
-        length = vmath("LENGTH", delta, None, col + 1, row)
-        scale = math("MULTIPLY",
-                     math("DIVIDE", math("SUBTRACT", rest, length, col + 2, row),
-                          math("MAXIMUM", length, 1e-6, col + 2, row + 1), col + 3, row),
-                     math("MULTIPLY", 0.5, gate, col + 3, row + 1), col + 4, row)
-        return vmath("SCALE", delta, scale, col + 5, row)
-
-    correction = vmath("ADD", pull(prev_p, has_prev, 38, 6),
-                       pull(next_p, has_next, 38, 9), 44, 6)
-    solve = set_position(solve, vmath("ADD", position, correction, 45, 6), 46, 1)
-
-    # -- bending stiffness.
+    # -- bending stiffness, from the material.
     # Distance constraints alone make a *chain*, not a noodle: consecutive
-    # segments may meet at any angle, so the curve kinks hard and Curve to
-    # Mesh pinches the tube shut at every reversal, which renders as a heap of
-    # short stubs. Real spaghetti resists bending.
+    # segments may meet at any angle, so the curve kinks hard. Real cooked
+    # pasta resists bending with a Young's modulus E, and with its weight
+    # that sets one length scale, the elasto-gravity length
+    # L_g = (E I / (rho g A))^(1/3): roughly the radius a draped strand
+    # curves over.
     #
-    # It is solved as XPBD. The constraint is C = |p - midpoint of neighbours|,
-    # whose gradients are n at the centre and -n/2 at each neighbour, summing
-    # to zero - so the correction conserves momentum. That matters: a plain
-    # drag toward the midpoint moves mass with nothing moving back and injects
-    # energy, which sent the pile to a height of 929 and a radius of 1689,
-    # worse the stiffer it got.
+    # The constraint at each interior point is the vector C = p - midpoint of
+    # its neighbours. Curvature is about 2|C| / l^2, so a beam's bending
+    # energy E I kappa^2 l / 2 per joint is k |C|^2 / 2 with k = 4 E I / l^3.
+    # Inverse masses in this solver are 1, not 1/kg, so the compliance that
+    # reproduces the beam is alpha = m / k = rho l^4 / (E r^2): physical,
+    # independent of the substep count, and scaled correctly with radius and
+    # segment length - a thin strand is much floppier than a thick one of
+    # the same material, as it should be.
     #
-    # What XPBD adds over scaling that correction by a stiffness factor is the
-    # compliance term. A plain factor is applied once per iteration, so the
-    # rigidity you actually get depends on Iterations and Substeps - retune the
-    # solver and the noodles change stiffness. Here compliance alpha carries
-    # the physical units, alpha/dt^2 makes it step-size independent, and the
-    # multiplier lambda accumulates across iterations so the constraint
-    # converges to the same equilibrium whatever the counts are.
+    # It is solved exactly for the whole strand at once (the factorisation
+    # is set up once a frame, before the substeps). An iterated solve could
+    # not reach these stiffnesses: the previous Jacobi version needed its
+    # steps scaled down to stay stable, and with only a couple of passes per
+    # substep that left every noodle many times floppier than its Stiffness
+    # said, with hairpin kinks wherever a strand hung over an edge - the
+    # bent-drinking-straw look - and raising Stiffness barely changed it.
+    # The constraint is linear in position, so one solve is exact.
+    def bending(solve):
+        lam = named(ATTR_BLAM, "FLOAT_VECTOR", 47, 18)
+        own = vmath("SUBTRACT", position,
+                    vmath("SCALE", vmath("ADD", prev_p, next_p, 47, 19), 0.5, 48, 19), 49, 19)
+        then = named(ATTR_PREV, "FLOAT_VECTOR", 46, 20)
+        own_then = vmath("SUBTRACT", then,
+                         vmath("SCALE",
+                               vmath("ADD", at_index(then, math("SUBTRACT", index, 1, 46, 21), "FLOAT_VECTOR", 47, 21),
+                                     at_index(then, math("ADD", index, 1, 46, 22), "FLOAT_VECTOR", 47, 22),
+                                     48, 21), 0.5, 49, 21), 50, 21)
+        # -(C + a lambda + gamma (C - C at the start of the substep)) / (1 + gamma)
+        rhs = vmath("SCALE",
+                    vmath("ADD",
+                          vmath("ADD", own, vmath("SCALE", lam, alpha_dt, 49, 20), 50, 19),
+                          vmath("SCALE", vmath("SUBTRACT", own, own_then, 51, 21), bend_gamma, 52, 21),
+                          51, 20),
+                    math("MULTIPLY", math("MULTIPLY", interior, -1.0, 49, 23), bend_scale, 50, 23), 51, 19)
+        solve = store(solve, ATTR_BEND_DRE, rhs, "FLOAT_VECTOR", 52, 1)
+        solve = store(solve, ATTR_BEND_DIM, (0.0, 0.0, 0.0), "FLOAT_VECTOR", 53, 1)
+
+        rep_b_in = nd("GeometryNodeRepeatInput", 54, 2)
+        rep_b_out = nd("GeometryNodeRepeatOutput", 62, 2)
+        rep_b_in.pair_with_output(rep_b_out)
+        plug(rep_b_in.inputs["Iterations"], pcr_rounds)
+        plug(rep_b_in.inputs["Geometry"], solve)
+        b_stride = math("POWER", 2.0, rep_b_in.outputs["Iteration"], 54, 4)
+        b_lo_ok = math("GREATER_THAN", math("SUBTRACT", spline_i, b_stride, 55, 4), -0.5, 56, 4)
+        b_hi_ok = math("LESS_THAN", math("ADD", spline_i, b_stride, 55, 5),
+                       math("SUBTRACT", point_count, 0.5, 55, 6), 56, 5)
+        b_lo_i = math("SUBTRACT", index, b_stride, 55, 7)
+        b_hi_i = math("ADD", index, b_stride, 55, 8)
+        kk = named(level_name(rep_b_in.outputs["Iteration"], 54, 9), "FLOAT_COLOR", 56, 9)
+        q1r, q1i, q2r, q2i = colour_read(kk, 57, 9)
+        dre = named(ATTR_BEND_DRE, "FLOAT_VECTOR", 56, 11)
+        dim = named(ATTR_BEND_DIM, "FLOAT_VECTOR", 56, 12)
+
+        def neighbour(field, idx, ok, col, row):
+            return vmath("SCALE", at_index(field, idx, "FLOAT_VECTOR", col, row), ok, col + 1, row)
+
+        lre, lim = neighbour(dre, b_lo_i, b_lo_ok, 57, 11), neighbour(dim, b_lo_i, b_lo_ok, 57, 12)
+        hre, him = neighbour(dre, b_hi_i, b_hi_ok, 57, 13), neighbour(dim, b_hi_i, b_hi_ok, 57, 14)
+
+        def ctimes(kr, ki, vr, vi, col, row):
+            """Complex scalar times complex vector."""
+            return (vmath("SUBTRACT", vmath("SCALE", vr, kr, col, row), vmath("SCALE", vi, ki, col, row + 1),
+                          col + 1, row),
+                    vmath("ADD", vmath("SCALE", vi, kr, col, row + 2), vmath("SCALE", vr, ki, col, row + 3),
+                          col + 1, row + 2))
+
+        xr1, xi1 = ctimes(q1r, q1i, lre, lim, 59, 11)
+        xr2, xi2 = ctimes(q2r, q2i, hre, him, 59, 15)
+        new_re = vmath("SUBTRACT", dre, vmath("ADD", xr1, xr2, 61, 11), 62, 11)
+        new_im = vmath("SUBTRACT", dim, vmath("ADD", xi1, xi2, 61, 13), 62, 13)
+        # Both halves are computed from the old values: stage one, then move it.
+        rb = store(rep_b_in.outputs["Geometry"], ATTR_BEND_TMP_B, new_im, "FLOAT_VECTOR", 58, 2)
+        rb = store(rb, ATTR_BEND_DRE, new_re, "FLOAT_VECTOR", 59, 2)
+        rb = store(rb, ATTR_BEND_DIM, named(ATTR_BEND_TMP_B, "FLOAT_VECTOR", 60, 3), "FLOAT_VECTOR", 60, 2)
+        plug(rep_b_out.inputs["Geometry"], rb)
+        solve = rep_b_out.outputs["Geometry"]
+
+        # z = Re[d / b] / a, then the end-row correction.
+        zbr, zbi, _ = sep(named(ATTR_BEND_B, "FLOAT_VECTOR", 63, 4), 64, 4)
+        zden = math("MULTIPLY",
+                    math("ADD", math("MULTIPLY", zbr, zbr, 65, 4), math("MULTIPLY", zbi, zbi, 65, 5), 66, 4),
+                    alpha_hat, 67, 4)
+        z = vmath("SCALE",
+                  vmath("ADD", vmath("SCALE", named(ATTR_BEND_DRE, "FLOAT_VECTOR", 63, 6), zbr, 64, 6),
+                        vmath("SCALE", named(ATTR_BEND_DIM, "FLOAT_VECTOR", 63, 7), zbi, 64, 7), 65, 6),
+                  math("DIVIDE", 1.0, zden, 66, 6), 67, 6)
+        solve = store(solve, ATTR_BEND_DRE, z, "FLOAT_VECTOR", 64, 1)
+        zz = named(ATTR_BEND_DRE, "FLOAT_VECTOR", 65, 8)
+        first_iz = math("ADD", math("SUBTRACT", index, spline_i, 65, 9), 1.0, 66, 9)
+        last_iz = math("ADD", math("SUBTRACT", index, spline_i, 65, 10),
+                       math("SUBTRACT", point_count, 2.0, 65, 11), 66, 10)
+        t0 = at_index(zz, first_iz, "FLOAT_VECTOR", 67, 9)
+        t1 = at_index(zz, last_iz, "FLOAT_VECTOR", 67, 10)
+        s00, s01, s10, s11 = colour_read(named(ATTR_BEND_S, "FLOAT_COLOR", 66, 12), 67, 12)
+        w0 = vmath("ADD", vmath("SCALE", t0, s00, 68, 9), vmath("SCALE", t1, s01, 68, 10), 69, 9)
+        w1 = vmath("ADD", vmath("SCALE", t0, s10, 68, 11), vmath("SCALE", t1, s11, 68, 12), 69, 11)
+        yb0, yb1, _ = sep(named(ATTR_BEND_Y, "FLOAT_VECTOR", 68, 13), 69, 13)
+        dlam_v = vmath("SCALE",
+                       vmath("SUBTRACT", zz,
+                             vmath("ADD", vmath("SCALE", w0, yb0, 70, 9), vmath("SCALE", w1, yb1, 70, 10),
+                                   71, 9), 72, 9),
+                       interior, 73, 9)
+        solve = store(solve, ATTR_BDLAM, dlam_v, "FLOAT_VECTOR", 65, 1)
+        dl = named(ATTR_BDLAM, "FLOAT_VECTOR", 66, 14)
+        # Dummy end rows carry zero, so neighbours need no strand check.
+        bend = vmath("SUBTRACT", dl,
+                     vmath("SCALE",
+                           vmath("ADD",
+                                 vmath("SCALE", at_index(dl, math("SUBTRACT", index, 1, 67, 15),
+                                                         "FLOAT_VECTOR", 68, 15), has_prev, 69, 15),
+                                 vmath("SCALE", at_index(dl, math("ADD", index, 1, 67, 16),
+                                                         "FLOAT_VECTOR", 68, 16), has_next, 69, 16),
+                                 70, 15), 0.5, 71, 15), 72, 15)
+        solve = set_position(solve, vmath("ADD", position, bend, 73, 15), 66, 1)
+        solve = store(solve, ATTR_BLAM, vmath("ADD", lam, dl, 67, 17), "FLOAT_VECTOR", 67, 1)
+        return solve
+
+
+    # -- inextensibility, solved exactly along each strand.
+    # A noodle does not stretch measurably under its own weight. Solved as
+    # local distance constraints (Jacobi, two iterations) the length error
+    # could only diffuse one segment per pass, and a strand hanging over a
+    # rod came out 13% longer than it is - a rubber band, and a pile whose
+    # upper strands never really bore down on the lower ones.
     #
-    # The rope's own length constraint needs none of this: it is already XPBD
-    # at zero compliance, which is exactly the rigid half-correction above.
-    prev2_p = at_index(position, math("SUBTRACT", index, 2, 47, 7), "FLOAT_VECTOR", 48, 7)
-    next2_p = at_index(position, math("ADD", index, 2, 47, 11), "FLOAT_VECTOR", 48, 11)
+    # Instead all of a strand's distance constraints are solved together, as
+    # one linear system: XPBD's (J W J^T) dlambda = -C, which for a chain is
+    # tridiagonal - 2 on the diagonal, minus the cosine between neighbouring
+    # segments off it. Parallel cyclic reduction solves a tridiagonal system
+    # with every point working at once: each round, every row eliminates the
+    # rows `stride` away and the stride doubles, so ceil(log2(points)) rounds
+    # decouple it completely. One solve projects the whole strand to its rest
+    # length the way a mass-weighted projection should, conserving momentum,
+    # and the tension it carries is the weight of everything hanging below.
+    u = vmath("NORMALIZE", vmath("SUBTRACT", position, prev_p, 70, 7), None, 71, 7)
+    seg_len = vmath("LENGTH", vmath("SUBTRACT", position, prev_p, 70, 8), None, 71, 8)
+    solve = store(solve, ATTR_SDIR, vmath("SCALE", u, has_prev, 72, 7), "FLOAT_VECTOR", 72, 1)
+    u_s = named(ATTR_SDIR, "FLOAT_VECTOR", 73, 6)
+    u_prev = at_index(u_s, math("SUBTRACT", index, 1, 73, 7), "FLOAT_VECTOR", 74, 7)
+    u_next = at_index(u_s, math("ADD", index, 1, 73, 8), "FLOAT_VECTOR", 74, 8)
+    row_a = math("MULTIPLY", math("MULTIPLY", vmath("DOT_PRODUCT", u_prev, u_s, 75, 7), -1.0, 76, 7),
+                 has_prev2_row, 77, 7)
+    row_c = math("MULTIPLY", math("MULTIPLY", vmath("DOT_PRODUCT", u_next, u_s, 75, 8), -1.0, 76, 8),
+                 math("MULTIPLY", has_prev, has_next, 76, 9), 77, 8)
+    row_b = math("ADD", 1.0, has_prev, 75, 9)  # 2 for a real row, 1 for the dummy at spline start
+    row_d = math("MULTIPLY", math("SUBTRACT", rest, seg_len, 75, 10), has_prev, 76, 10)
+    solve = store(solve, ATTR_SD, row_d, "FLOAT", 78, 1)
+    solve = store(solve, ATTR_SABC, xyz(row_a, row_b, row_c, 78, 8), "FLOAT_VECTOR", 79, 1)
 
-    def offset(left, middle, right, col, row):
-        """How far `middle` sits off the line between its two neighbours."""
-        return vmath("SUBTRACT", middle,
-                     vmath("SCALE", vmath("ADD", left, right, col, row), 0.5, col + 1, row),
-                     col + 2, row)
+    pcr_in = nd("GeometryNodeRepeatInput", 80, 2)
+    pcr_out = nd("GeometryNodeRepeatOutput", 86, 2)
+    pcr_in.pair_with_output(pcr_out)
+    plug(pcr_in.inputs["Iterations"], pcr_rounds)
+    plug(pcr_in.inputs["Geometry"], solve)
+    stride = math("POWER", 2.0, pcr_in.outputs["Iteration"], 80, 4)
+    abc = named(ATTR_SABC, "FLOAT_VECTOR", 80, 5)
+    dd = named(ATTR_SD, "FLOAT", 80, 6)
+    lo_ok = math("GREATER_THAN", math("SUBTRACT", spline_i, stride, 81, 7), -0.5, 82, 7)
+    hi_ok = math("LESS_THAN", math("ADD", spline_i, stride, 81, 8),
+                 math("SUBTRACT", point_count, 0.5, 81, 9), 82, 8)
+    lo_i = math("SUBTRACT", index, stride, 81, 10)
+    hi_i = math("ADD", index, stride, 81, 11)
+    # Rows outside the strand read as the identity row (0, 1, 0 | 0).
+    identity = (0.0, 1.0, 0.0)
+    abc_lo = mix_vec(lo_ok, identity, at_index(abc, lo_i, "FLOAT_VECTOR", 82, 10), 83, 10)
+    abc_hi = mix_vec(hi_ok, identity, at_index(abc, hi_i, "FLOAT_VECTOR", 82, 11), 83, 11)
+    d_lo = math("MULTIPLY", at_index(dd, lo_i, "FLOAT", 82, 12), lo_ok, 83, 12)
+    d_hi = math("MULTIPLY", at_index(dd, hi_i, "FLOAT", 82, 13), hi_ok, 83, 13)
+    a0, b0, c0 = sep(abc, 81, 5)
+    al, bl, cl = sep(abc_lo, 84, 10)
+    ah, bh, ch = sep(abc_hi, 84, 11)
+    k1 = math("DIVIDE", a0, bl, 85, 10)
+    k2 = math("DIVIDE", c0, bh, 85, 11)
+    d_new = math("SUBTRACT", dd,
+                 math("ADD", math("MULTIPLY", d_lo, k1, 86, 12),
+                      math("MULTIPLY", d_hi, k2, 86, 13), 87, 12), 88, 12)
+    abc_new = xyz(math("MULTIPLY", math("MULTIPLY", al, k1, 86, 7), -1.0, 87, 7),
+                  math("SUBTRACT", b0,
+                       math("ADD", math("MULTIPLY", cl, k1, 86, 8),
+                            math("MULTIPLY", ah, k2, 86, 9), 87, 8), 88, 8),
+                  math("MULTIPLY", math("MULTIPLY", ch, k2, 86, 10), -1.0, 87, 10), 89, 8)
+    # d first: it reads the old coefficients, which the second store replaces.
+    reduced = store(pcr_in.outputs["Geometry"], ATTR_SD, d_new, "FLOAT", 84, 2)
+    reduced = store(reduced, ATTR_SABC, abc_new, "FLOAT_VECTOR", 85, 2)
+    plug(pcr_out.inputs["Geometry"], reduced)
+    solve = pcr_out.outputs["Geometry"]
 
-    # Each triple only exists where both of its outer points do.
-    has_prev2 = math("GREATER_THAN", spline_i, 1.5, 49, 7)
-    has_next2 = math("LESS_THAN", spline_i, math("SUBTRACT", point_count, 2.5, 49, 11), 50, 11)
-    interior = math("MULTIPLY", has_prev, has_next, 49, 9)
-
-    own = offset(prev_p, position, next_p, 50, 9)
-    own_dir = vmath("NORMALIZE", own, None, 53, 9)
-
-    # Stiffness 1 means zero compliance, i.e. as rigid as the solver gets.
-    alpha = math("MULTIPLY", BEND_COMPLIANCE,
-                 math("SUBTRACT",
-                      math("DIVIDE", 1.0, math("MAXIMUM", P["Stiffness"], 1e-4, 47, 13), 48, 13),
-                      1.0, 49, 13), 50, 13)
-    alpha_dt = math("DIVIDE", alpha, math("MAXIMUM", math("MULTIPLY", dt, dt, 48, 14),
-                                          1e-12, 49, 14), 51, 13)
-    lam = named(ATTR_BLAM, "FLOAT", 47, 15)
-    # Sum of w|grad C|^2 over the three points: 1 + 1/4 + 1/4.
-    delta_lam = math("MULTIPLY",
-                     math("DIVIDE",
-                          math("SUBTRACT",
-                               math("MULTIPLY", vmath("LENGTH", own, None, 53, 10), -1.0, 54, 10),
-                               math("MULTIPLY", alpha_dt, lam, 52, 15), 55, 10),
-                          math("ADD", 1.5, alpha_dt, 52, 14), 56, 10),
-                     math("MULTIPLY", interior, JACOBI_RELAX, 57, 10), 57, 11)
-    # Parked on the geometry so the position update and the lambda update
-    # below both read the same value, computed from pre-update positions.
-    solve = store(solve, ATTR_BDLAM, delta_lam, "FLOAT", 58, 1)
-
-    dlam = named(ATTR_BDLAM, "FLOAT", 59, 9)
-    bend = vmath("ADD",
-                 vmath("SCALE", own_dir, dlam, 60, 9),
-                 vmath("ADD",
-                       vmath("SCALE",
-                             vmath("NORMALIZE", offset(prev2_p, prev_p, position, 59, 7),
-                                   None, 62, 7),
-                             math("MULTIPLY", math("MULTIPLY", -0.5, has_prev2, 60, 7),
-                                  at_index(dlam, math("SUBTRACT", index, 1, 60, 6),
-                                           "FLOAT", 61, 6), 63, 7), 64, 7),
-                       vmath("SCALE",
-                             vmath("NORMALIZE", offset(position, next_p, next2_p, 59, 11),
-                                   None, 62, 11),
-                             math("MULTIPLY", math("MULTIPLY", -0.5, has_next2, 60, 11),
-                                  at_index(dlam, math("ADD", index, 1, 60, 12),
-                                           "FLOAT", 61, 12), 63, 11), 64, 11),
-                       65, 10),
-                 66, 9)
-    solve = set_position(solve, vmath("ADD", position, bend, 67, 9), 68, 1)
-    solve = store(solve, ATTR_BLAM, math("ADD", lam, dlam, 69, 9), "FLOAT", 70, 1)
+    _, b_fin, _ = sep(named(ATTR_SABC, "FLOAT_VECTOR", 87, 4), 88, 4)
+    lam_s = math("DIVIDE", named(ATTR_SD, "FLOAT", 87, 5), b_fin, 89, 4)
+    solve = store(solve, ATTR_SD, lam_s, "FLOAT", 90, 1)
+    lam_st = named(ATTR_SD, "FLOAT", 90, 5)
+    stretch_fix = vmath("SUBTRACT",
+                        vmath("SCALE", u_s, lam_st, 91, 5),
+                        vmath("SCALE", u_next,
+                              math("MULTIPLY",
+                                   at_index(lam_st, math("ADD", index, 1, 90, 6), "FLOAT", 91, 6),
+                                   has_next, 92, 6), 92, 7), 93, 5)
+    solve = set_position(solve, vmath("ADD", position, stretch_fix, 94, 5), 95, 1)
 
     # -- push apart noodles that overlap.
     # Index of Nearest excludes only the point itself, so a point's own chain
@@ -876,25 +1338,47 @@ def build_group():
                          col + 3, row + 1)
         return math("MAXIMUM", other_noodle, far_along, col + 5, row)
 
+    def closest_on_strand(near_socket, col, row):
+        """Closest point to this one on the other strand's two segments either
+        side of the nearest sample. Point-to-point contact pushed along the
+        line between samples, which at a crossing is tilted whenever the
+        samples do not line up: an upper strand then shoved the one below it
+        sideways on every substep and a settled pile crawled and buzzed. The
+        segment gives the true normal of the strand surface."""
+        j_pos = at_index(position, near_socket, "FLOAT_VECTOR", col, row)
+        ends = []
+        for k, (step, gate_field) in enumerate(((-1, has_prev), (1, has_next))):
+            other = at_index(position, math("ADD", near_socket, float(step), col, row + 1 + k),
+                             "FLOAT_VECTOR", col + 1, row + 1 + k)
+            gate = at_index(gate_field, near_socket, "FLOAT", col + 1, row + 3 + k)
+            seg = vmath("SCALE", vmath("SUBTRACT", other, j_pos, col + 2, row + 1 + k), gate,
+                        col + 3, row + 1 + k)
+            t = math("MINIMUM",
+                     math("MAXIMUM",
+                          math("DIVIDE", vmath("DOT_PRODUCT", vmath("SUBTRACT", position, j_pos,
+                                                                     col + 2, row + 5 + k),
+                                               seg, col + 3, row + 5 + k),
+                               math("MAXIMUM", vmath("DOT_PRODUCT", seg, seg, col + 3, row + 7 + k),
+                                    1e-12, col + 4, row + 7 + k), col + 4, row + 5 + k),
+                          0.0, col + 5, row + 5 + k), 1.0, col + 6, row + 5 + k)
+            q = vmath("ADD", j_pos, vmath("SCALE", seg, t, col + 7, row + 5 + k), col + 8, row + 5 + k)
+            ends.append(q)
+        d0 = vmath("DISTANCE", position, ends[0], col + 9, row + 5)
+        d1 = vmath("DISTANCE", position, ends[1], col + 9, row + 6)
+        return mix_vec(math("LESS_THAN", d1, d0, col + 10, row + 6), ends[0], ends[1], col + 11, row + 5)
+
     near_index = named(ATTR_NEAR, "INT", 46, 4)
-    near_pos = at_index(position, near_index, "FLOAT_VECTOR", 47, 4)
+    near_pos = closest_on_strand(near_index, 30, 40)
     away = vmath("SUBTRACT", position, near_pos, 48, 4)
     gap = vmath("LENGTH", away, None, 49, 4)
     off_chain = contact_allowed(near_index, 46, 6)
+    push_share = 0.5
     overlap = math("MAXIMUM", math("SUBTRACT", diameter, gap, 50, 4), 0.0, 51, 4)
     # Cohesion: cooked pasta clings to itself, and a pile of it is not a pile
     # of dry sticks. Just past contact the same pair is pulled back together
     # instead of ignored, which costs almost nothing - the neighbour query it
     # needs is already the most expensive thing in the frame and is paid for
     # by the push above. Negative overlap, so one expression covers both.
-    reach = math("MULTIPLY", diameter, COHESION_REACH, 50, 7)
-    cling = math("MULTIPLY",
-                 math("MULTIPLY",
-                      math("SUBTRACT", diameter, gap, 51, 7),   # negative outside contact
-                      math("LESS_THAN", gap, reach, 52, 7), 53, 7),
-                 P["Cohesion"], 54, 7)
-    # Only the separating half is cohesion; the overlapping half is the push.
-    separation = math("MINIMUM", cling, 0.0, 55, 7)
     # Cap how far one pass may move a point. A coiled noodle crosses itself,
     # so noodles spawn already overlapped, and an unclamped push turns that
     # first-frame overlap into launch velocity - the pile rose instead of
@@ -903,20 +1387,29 @@ def build_group():
     limit = math("MULTIPLY", rest, PUSH_LIMIT, 51, 5)
     amount = math("MINIMUM",
                   math("MAXIMUM",
-                       math("MULTIPLY", math("ADD", overlap, separation, 52, 4), 0.5, 53, 4),
+                       math("MULTIPLY", overlap, push_share, 53, 4),
                        math("MULTIPLY", limit, -1.0, 52, 5), 53, 5),
                   limit, 54, 5)
     push = vmath("SCALE", vmath("NORMALIZE", away, None, 50, 5),
                  math("MULTIPLY", amount,
                       math("MULTIPLY", off_chain, P["Self Collision"], 52, 6), 54, 4),
                  55, 4)
-    solve = set_position(solve, vmath("ADD", position, push, 56, 4), 57, 1)
+    solve = store(solve, ATTR_NPUSH,
+                  math("ADD", named(ATTR_NPUSH, "FLOAT", 55, 8),
+                       math("MULTIPLY", math("MAXIMUM", amount, 0.0, 55, 9),
+                            math("MULTIPLY", off_chain, P["Self Collision"], 55, 10), 56, 9),
+                       57, 8), "FLOAT", 79, 1)
+    solve = set_position(solve, vmath("ADD", position, push, 56, 4), 80, 1)
 
     # -- floor. A hard constraint, so it belongs inside the loop.
     px, py, pz = sep(position, 56, 6)
+    spush = named(ATTR_SPUSH, "FLOAT", 57, 10)
+    solve = store(solve, ATTR_SPUSH,
+                  math("ADD", spush, math("MAXIMUM", math("SUBTRACT", P["Noodle Radius"], pz, 57, 11),
+                                          0.0, 58, 11), 59, 10), "FLOAT", 80, 2)
     solve = set_position(solve,
                          xyz(px, py, math("MAXIMUM", pz, P["Noodle Radius"], 57, 6), 58, 6),
-                         59, 1)
+                         81, 1)
 
     # -- collider, as a distance field.
     #
@@ -952,8 +1445,8 @@ def build_group():
                        math("MULTIPLY", diameter, COHESION_REACH - 1.0, 54, 8), 54, 9)
     pull_cap = math("MULTIPLY", math("MULTIPLY", rest, PUSH_LIMIT, 54, 10), -1.0, 54, 11)
 
-    def collider_pass(solve, grid, stickiness, present, col, row):
-        """Push out of one field, cling to it, and report the distance."""
+    def collider_pass(solve, grid, stickiness, present, col, row, accumulate=True):
+        """Push out of one field, cling to it, and report distance and normal."""
         incoming = solve
         d_i, grad_i = sdf_probe(grid, position, col, row)
         # Outside the narrow band the grid is a constant, so the gradient is
@@ -975,10 +1468,16 @@ def build_group():
         clear = math("MULTIPLY",
                      math("ADD", math("MULTIPLY", depth, push_side, col + 6, row),
                           stick, col + 7, row), in_band, col + 8, row)
+        normal = vmath("NORMALIZE", grad_i, None, col + 7, row + 2)
+        if accumulate:
+            solve = store(solve, ATTR_SPUSH,
+                          math("ADD", spush,
+                               math("MULTIPLY", math("MULTIPLY", depth, push_side, col + 9, row + 7),
+                                    in_band, col + 10, row + 7), col + 11, row + 7),
+                          "FLOAT", col + 9, 0)
         solve = set_position(
             solve, vmath("ADD", position,
-                         vmath("SCALE", vmath("NORMALIZE", grad_i, None, col + 7, row + 2),
-                               clear, col + 8, row + 2), col + 9, row + 2), col + 10, 1)
+                         vmath("SCALE", normal, clear, col + 8, row + 2), col + 9, row + 2), col + 10, 1)
         # What the friction stage needs, taken from the probe already paid for.
         # Parked far away outside the band, so points nowhere near a collider
         # read as "not touching" rather than as "sitting on the surface".
@@ -996,36 +1495,46 @@ def build_group():
         plug(distance_switch.inputs["Switch"], present)
         plug(distance_switch.inputs["False"], 1e9)
         plug(distance_switch.inputs["True"], gated)
-        return geometry_switch.outputs["Output"], distance_switch.outputs["Output"]
+        return (geometry_switch.outputs["Output"], distance_switch.outputs["Output"],
+                normal)
 
-    solve, d_plain = collider_pass(solve, grid, P["Collider Stickiness"], has_plain, 55, 8)
-    solve, d_stick = collider_pass(solve, sticky_grid, P["Sticky Collider Grip"], has_sticky, 55, 16)
+    solve, d_plain, n_plain = collider_pass(solve, grid, P["Collider Stickiness"], has_plain, 82, 8)
+    solve, d_stick, n_stick = collider_pass(solve, sticky_grid, P["Sticky Collider Grip"], has_sticky, 82, 16)
     # Friction only cares which surface is nearest, not which set it came from.
-    solve = store(solve, ATTR_CDIST, math("MINIMUM", d_plain, d_stick, 66, 12),
-                  "FLOAT", 67, 12)
+    solve = store(solve, ATTR_CDIST, math("MINIMUM", d_plain, d_stick, 93, 12),
+                  "FLOAT", 94, 12)
+    solve = store(solve, ATTR_CNRM,
+                  mix_vec(math("LESS_THAN", d_stick, d_plain, 93, 13), n_plain, n_stick, 94, 13),
+                  "FLOAT_VECTOR", 95, 12)
 
-
+    solve = bending(solve)
     plug(rep_out.inputs["Geometry"], solve)
     state = rep_out.outputs["Geometry"]
 
     # ---------------------------------------------- velocity, then friction
-    # Velocity is whatever motion survived the constraints. That is also where
-    # the energy problem lives: resolving a penetration moves a point, and
-    # that motion becomes speed on the next frame, so a position-based solver
-    # quietly pumps energy into the pile. Left alone it spread the heap to a
-    # radius of 743 from a 200-unit spawn disc.
+    # Velocity is whatever motion survived the constraints. Friction acts
+    # here, on velocity, not on position: a positional version has to fight
+    # the constraints to do its job.
     #
-    # Friction therefore acts here, on velocity, not on position. A positional
-    # version has to fight the constraints to do its job; damping the velocity
-    # of contacting points removes the injected energy instead, and cannot
-    # stretch a noodle no matter how strong it is set.
+    # It is Coulomb friction. The normal impulse of a contact is how far the
+    # contact constraints pushed a point out this substep, summed over the
+    # iterations; the tangential velocity it may remove is Friction times
+    # that, divided by dt. A noodle at rest on a slope therefore holds while the slope is
+    # shallower than atan(Friction) and slides when it is steeper, landing
+    # kills sliding in proportion to how hard it lands, and the result does
+    # not change with the substep count. The previous rule removed a fixed
+    # 90% of all horizontal velocity on every substep of any contact, which
+    # made wet noodles behave like velcro: strands froze into loops and
+    # nests in mid-slump and never settled into the bowl.
     #
     # It has to cover noodle-against-noodle contact, not just the ground: only
     # the bottom layer is ever "on the floor", so a ground-only rule lets
-    # everything above it flow like a liquid.
+    # everything above it flow like a liquid. Noodle contacts use the
+    # velocity relative to the strand underneath, so a pile sliding as one
+    # mass keeps sliding.
     prev_pos = named(ATTR_PREV, "FLOAT_VECTOR", 64, 3)
-    velocity_out = vmath("SCALE", vmath("SUBTRACT", position, prev_pos, 65, 3),
-                         math("DIVIDE", 1.0, math("MAXIMUM", dt, 1e-6, 65, 4), 66, 4), 67, 3)
+    inv_dt = math("DIVIDE", 1.0, math("MAXIMUM", dt, 1e-6, 65, 4), 66, 4)
+    velocity_out = vmath("SCALE", vmath("SUBTRACT", position, prev_pos, 65, 3), inv_dt, 67, 3)
 
     _, _, fz = sep(position, 64, 6)
     # Contact skins are a fraction of the radius, never a fixed distance. A
@@ -1038,10 +1547,8 @@ def build_group():
     # has already separated the pair by now, so this asks "still touching",
     # not "was overlapping".
     near_after = named(ATTR_NEAR, "INT", 64, 9)
-    touch_gap = vmath("LENGTH",
-                      vmath("SUBTRACT", position,
-                            at_index(position, near_after, "FLOAT_VECTOR", 65, 9), 66, 9),
-                      None, 67, 9)
+    near_vec = vmath("SUBTRACT", position, closest_on_strand(near_after, 30, 60), 66, 9)
+    touch_gap = vmath("LENGTH", near_vec, None, 67, 9)
     touching = math("MULTIPLY",
                     math("LESS_THAN", touch_gap,
                          math("MULTIPLY", diameter, 1.1, 65, 10), 68, 10),
@@ -1052,34 +1559,130 @@ def build_group():
     # sliding around the inside of a bowl instead of settling in it.
     on_collider = math("LESS_THAN", named(ATTR_CDIST, "FLOAT", 64, 11),
                        math("MULTIPLY", P["Noodle Radius"], CONTACT_SKIN, 65, 12), 67, 11)
-    # Collider surfaces get their own friction: a ceramic plate is not as
-    # grippy as wet pasta on wet pasta, and wanting the two to differ is the
-    # usual reason a pile slides off a bowl or refuses to spread on one.
-    keep = math("SUBTRACT", 1.0,
-                math("MAXIMUM",
-                     math("MULTIPLY", math("MAXIMUM", on_floor, touching, 70, 9),
-                          P["Friction"], 71, 9),
-                     math("MULTIPLY", on_collider, P["Collider Friction"], 71, 10),
-                     72, 9),
-                73, 9)
-    # Suppress small contact oscillations without altering free fall. Use a
-    # radius/gravity velocity scale, and integrate damping over seconds so
-    # changing the adaptive step count does not change its strength.
+
+    def coulomb(v, normal, mu, gate, push_attr, col, row, share=1.0):
+        """Remove up to mu * (normal impulse) of `share` of the sliding part of v."""
+        vn = vmath("SCALE", normal, vmath("DOT_PRODUCT", v, normal, col, row), col + 1, row)
+        vt = vmath("SUBTRACT", v, vn, col + 2, row)
+        push = math("MULTIPLY", named(push_attr, "FLOAT", col, row + 1), inv_dt, col + 1, row + 1)
+        cut = math("MINIMUM",
+                   math("DIVIDE", math("MULTIPLY", math("MULTIPLY", push, mu, col + 2, row + 1),
+                                       gate, col + 3, row + 1),
+                        math("MAXIMUM", vmath("LENGTH", vt, None, col + 2, row + 2), 1e-9,
+                             col + 3, row + 2), col + 4, row + 1),
+                   1.0, col + 5, row + 1)
+        return vmath("SCALE", vt, math("MULTIPLY", cut, share, col + 5, row + 2), col + 6, row)
+
+    # Surfaces that do not move with the noodle: floor and colliders. A point
+    # on the collider uses its normal and Collider Friction; otherwise the
+    # floor's, with Friction.
+    surface_normal = mix_vec(on_collider, (0.0, 0.0, 1.0), named(ATTR_CNRM, "FLOAT_VECTOR", 66, 16),
+                             67, 16)
+    mu_mix = nd("ShaderNodeMix", 66, 17, data_type="FLOAT", factor_mode="UNIFORM")
+    plug(pick_in(mu_mix, "Factor"), on_collider)
+    plug(pick_in(mu_mix, "A"), P["Friction"])
+    plug(pick_in(mu_mix, "B"), P["Collider Friction"])
+    surface_mu = pick_out(mu_mix, "Result")
+    surface_gate = math("MAXIMUM", on_floor, on_collider, 67, 17)
+    surface_cut = coulomb(velocity_out, surface_normal, surface_mu, surface_gate, ATTR_SPUSH, 68, 16)
+    velocity_out = vmath("SUBTRACT", velocity_out, surface_cut, 75, 16)
+    # Surface friction acts on this substep's displacement too, not only on
+    # the velocity carried into the next one: otherwise every substep's
+    # gravity still slides a resting noodle a little before friction catches
+    # it, and a strand on a 15 degree slope with Friction 0.5 crept at
+    # 12 mm/s. Only the tangential part changes, so the contact stays
+    # resolved. Noodle-on-noodle friction stays on velocity alone: moving
+    # those points shifted them against their own strand's constraints, and
+    # the next substep's correction made a dense pile tremble.
+    state = store(state, ATTR_SFRIC, vmath("SCALE", surface_cut, dt, 76, 17), "FLOAT_VECTOR", 76, 2)
+    # Noodle on noodle: friction on the velocity relative to the touching strand.
+    near_vel = at_index(vmath("SCALE", vmath("SUBTRACT", position, prev_pos, 68, 19), inv_dt, 69, 19),
+                        near_after, "FLOAT_VECTOR", 70, 19)
+    relative = vmath("SUBTRACT", velocity_out, near_vel, 71, 19)
+    contact_normal = vmath("NORMALIZE", near_vec, None, 71, 20)
+    # Both points of a touching pair apply this, each to itself, so a pair
+    # side by side meets halfway; but a strand lying on another takes on the
+    # lower one's motion, which is what is carrying it. Removing all of the
+    # relative velocity on both sides instead swapped their velocities every
+    # substep, and the pile never stopped trading motion back and forth.
+    upper_share = math("ADD", 0.5,
+                       math("MULTIPLY", sep(contact_normal, 71, 21)[2], 0.5, 72, 21), 73, 21)
+    velocity_out = vmath("SUBTRACT", velocity_out,
+                         coulomb(relative, contact_normal, P["Friction"], touching, ATTR_NPUSH, 72, 19,
+                                 share=upper_share), 79, 19)
+    # Wet noodles do not bounce off each other: the approaching or separating
+    # speed of a touching pair is shared out, as in a perfectly inelastic
+    # collision. Contacts here only ever see one neighbour each, so without
+    # this the position pushes rattled a settled pile at a few cm/s.
+    rel_n = vmath("DOT_PRODUCT", relative, contact_normal, 72, 23)
+    velocity_out = vmath("SUBTRACT", velocity_out,
+                         vmath("SCALE", contact_normal,
+                               math("MULTIPLY", math("MULTIPLY", rel_n, touching, 73, 23),
+                                    0.5, 74, 23), 75, 23), 79, 23)
+
+    # Cohesion: cooked pasta clings to itself, and a pile of it is not a pile
+    # of dry sticks. A strand within COHESION_REACH diameters of another is
+    # drawn to it with an acceleration of Cohesion times gravity - a force, so
+    # it does not depend on the step count, unlike the per-pass position pull
+    # it replaces, which also fought the contact push and kept the pile
+    # trembling.
+    reach = math("MULTIPLY", diameter, COHESION_REACH, 70, 25)
+    clinging = math("MULTIPLY",
+                    math("MULTIPLY", math("LESS_THAN", touch_gap, reach, 71, 25),
+                         contact_allowed(near_after, 65, 26), 72, 25),
+                    P["Self Collision"], 73, 25)
+    velocity_out = vmath("SUBTRACT", velocity_out,
+                         vmath("SCALE", contact_normal,
+                               math("MULTIPLY", math("MULTIPLY", P["Cohesion"], P["Gravity"], 74, 26),
+                                    math("MULTIPLY", dt, clinging, 75, 26), 76, 26), 77, 25), 80, 25)
+
+    state = store(state, ATTR_VEL, velocity_out, "FLOAT_VECTOR", 74, 1)
+    damped = named(ATTR_VEL, "FLOAT_VECTOR", 75, 21)
+
+    # Optional low-speed contact settling. Coulomb friction already holds a
+    # resting pile still; this only removes residual sub-millimetre buzz from
+    # the position-based contacts, at speeds well under a millimetre a frame.
     contact = math("MAXIMUM", on_floor,
                    math("MAXIMUM", touching, on_collider, 72, 12), 73, 12)
-    settle_speed = math("SQRT", math("MULTIPLY", P["Gravity"],
-                         P["Noodle Radius"], 72, 13), None, 73, 13)
-    motion = math("MINIMUM", math("DIVIDE", vmath("LENGTH", velocity_out, None, 72, 14),
+    settle_speed = math("MULTIPLY",
+                        math("SQRT", math("MULTIPLY", P["Gravity"], P["Noodle Radius"], 72, 13),
+                             None, 73, 13), SETTLE_FRACTION, 74, 13)
+    motion = math("MINIMUM", math("DIVIDE", vmath("LENGTH", damped, None, 72, 14),
                   math("MAXIMUM", settle_speed, 1e-9, 73, 14), 74, 14), 1.0, 75, 14)
     contact_keep = math("POWER", math("MAXIMUM", motion, 0.01, 76, 14),
                         math("MULTIPLY", math("MULTIPLY", dt, 144.0, 74, 12),
                              math("MULTIPLY", contact, P["Contact Damping"], 76, 12),
                              75, 12), 77, 14)
-    vx, vy, vz = sep(velocity_out, 68, 3)
-    result_velocity = xyz(math("MULTIPLY", vx, keep, 73, 3),
-                          math("MULTIPLY", vy, keep, 73, 4), vz, 74, 3)
-    state = store(state, ATTR_VEL, vmath("SCALE", result_velocity, contact_keep, 78, 14),
-                  "FLOAT_VECTOR", 75, 1)
+    state = store(state, ATTR_VEL, vmath("SCALE", damped, contact_keep, 78, 14),
+                  "FLOAT_VECTOR", 81, 1)
+    state = set_position(state, vmath("SUBTRACT", position, named(ATTR_SFRIC, "FLOAT_VECTOR", 79, 15),
+                                      81, 15), 82, 1)
+
+    # Post-stabilisation. Bending is solved last in each iteration so the
+    # strand's shape is never left kinked by a support, but that can leave a
+    # point a fraction of a millimetre inside a contact. Resolving it here,
+    # after velocity has been read back, removes the overlap without turning
+    # it into speed - otherwise the next substep's push-out became a bounce
+    # and the settled pile buzzed at a millimetre or two.
+    post_near = named(ATTR_NEAR, "INT", 82, 20)
+    post_away = vmath("SUBTRACT", position, closest_on_strand(post_near, 30, 50), 84, 20)
+    post_overlap = math("MINIMUM",
+                        math("MULTIPLY",
+                             math("MAXIMUM", math("SUBTRACT", diameter,
+                                                  vmath("LENGTH", post_away, None, 85, 21), 85, 20),
+                                  0.0, 86, 20), 0.5, 87, 20),
+                        math("MULTIPLY", rest, PUSH_LIMIT, 86, 21), 88, 20)
+    state = set_position(
+        state, vmath("ADD", position,
+                     vmath("SCALE", vmath("NORMALIZE", post_away, None, 85, 22),
+                           math("MULTIPLY", post_overlap,
+                                math("MULTIPLY", contact_allowed(post_near, 82, 23),
+                                     P["Self Collision"], 88, 23), 89, 22), 90, 22), 91, 22), 83, 2)
+    ppx, ppy, ppz = sep(position, 84, 25)
+    state = set_position(state, xyz(ppx, ppy, math("MAXIMUM", ppz, P["Noodle Radius"], 85, 25), 86, 25),
+                         84, 2)
+    state, _, _ = collider_pass(state, grid, 0.0, has_plain, 85, 28, accumulate=False)
+    state, _, _ = collider_pass(state, sticky_grid, 0.0, has_sticky, 85, 36, accumulate=False)
 
     plug(sub_out.inputs["Geometry"], state)
     plug(sim_out.inputs["Geometry"], sub_out.outputs["Geometry"])
@@ -1404,11 +2007,30 @@ def upgrade_solver(context, obj):
     saved = {s.name: get_input(obj, old, s.name) for s in old.interface.items_tree
              if s.item_type == "SOCKET" and s.in_out == "INPUT"
              and s.name in {p[0] for p in PARAMS}}
+    if old.get("noodle_solver_revision", 0) < 5:
+        # Revision 5 gave these sockets physical meanings: Friction became a
+        # Coulomb coefficient (it was a fraction of sliding speed removed per
+        # substep), Stiffness a Young's modulus, Damping extra drag on top of
+        # the physical air drag. Old values would mean something else now, so
+        # they take the new defaults, or the pile's noodle type's values.
+        for name in REVISION_5_PHYSICS:
+            saved.pop(name, None)
     ng = build_group()
     reset_simulation(context, obj)
     modifier.node_group = ng
     for name, value in saved.items():
         set_input(obj, ng, name, value)
+    if old.get("noodle_solver_revision", 0) < 5:
+        # The modifier keeps an old value under a matching socket, so these
+        # have to be written explicitly, not just left out of `saved`.
+        kind = obj.get("noodle_type")
+        if kind in NOODLE_TYPES:
+            from .presets import physics_inputs
+            fresh = physics_inputs(kind)
+        else:
+            fresh = {p[0]: p[2] for p in PARAMS}
+        for name in REVISION_5_PHYSICS:
+            set_input(obj, ng, name, fresh[name])
     obj.update_tag()
     context.scene.frame_set(context.scene.frame_start)
     return True
