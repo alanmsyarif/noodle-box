@@ -36,7 +36,7 @@ def create_demo(context):
     # The portion is lowered in as a loose coil of broad loops that stays
     # inside Fill Diameter - the bowl's well (the inner wall is 18.7 cm
     # across at the lip) less a margin - so every strand lands inside.
-    solver.set_input(noodles, ng, "Fill Diameter", .13)
+    solver.set_input(noodles, ng, "Fill Diameter", .12)
     solver.set_input(noodles, ng, "Collider", bowl)
     # Wet noodle on glazed stoneware is slippery: Coulomb coefficient ~0.3.
     solver.set_input(noodles, ng, "Collider Friction", .3)

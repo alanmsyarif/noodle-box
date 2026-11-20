@@ -1380,8 +1380,10 @@ def build_group():
                          math("ABSOLUTE",
                               math("SUBTRACT", near_socket, index, col + 1, row + 1),
                               col + 2, row + 1),
+                         # One more than the samples within a diameter: the
+                         # segment test reaches one sample past the nearest.
                          math("ADD", math("DIVIDE", diameter, rest, col + 1, row + 2),
-                              1.0, col + 2, row + 2),
+                              2.0, col + 2, row + 2),
                          col + 3, row + 1)
         return math("MAXIMUM", other_noodle, far_along, col + 5, row)
 
