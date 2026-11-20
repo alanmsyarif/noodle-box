@@ -31,13 +31,13 @@ def create_demo(context):
     noodles.name = "Udon - select for controls"
     apply_type(noodles, "udon", scene)
     solver.set_input(noodles, ng, "Noodle Count", 24)
-    solver.set_input(noodles, ng, "Fill Diameter", .09)
-    # A loose, mostly hanging spawn instead of wide flat coils: full coils
-    # reach ~17 cm from the axis and drape strands over a 20 cm bowl's rim.
-    # At 0.3 every strand lands inside (checked over several seeds).
-    solver.set_input(noodles, ng, "Spawn Coil", .3)
+    # The portion is poured as loose loops that stay inside Fill Diameter,
+    # which here is the bowl's well (the inner wall is 18.7 cm across at the
+    # lip) less a margin, so every strand lands inside.
+    solver.set_input(noodles, ng, "Fill Diameter", .13)
     solver.set_input(noodles, ng, "Collider", bowl)
-    solver.set_input(noodles, ng, "Collider Friction", .65)
+    # Wet noodle on glazed stoneware is slippery: Coulomb coefficient ~0.3.
+    solver.set_input(noodles, ng, "Collider Friction", .3)
 
     # Oak table, window light, bounce and flag cards, room world, 85 mm camera
     # with shallow depth of field, Cycles + AgX.
