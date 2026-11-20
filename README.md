@@ -19,18 +19,41 @@ For development, `noodle_physics.py` remains a compatibility launcher. Keep it n
 
 Choose a type in the sidebar's **Noodle library**. **Apply Type** updates dimensions, flexibility, cohesion, material, and profile shape, then restarts the selected pile. Collider assignments and seed are preserved. Turn off **Use suggested strand count** to preserve your count too.
 
-| Type | Length | Width | Profile | Suggested count |
+| Type | Length | Width | Cross-section and look | Suggested count |
 | --- | ---: | ---: | --- | ---: |
-| Udon | 24 cm | 10 mm | Round, pale, soft | 32 |
-| Ramen | 22 cm | 5 mm | Round, golden, firmer | 24 |
-| Spaghetti | 24 cm | 2.4 mm | Fine round pasta | 12 |
-| Soba | 20 cm | 3.6 mm | Darker matte buckwheat style | 18 |
-| Rice Ribbon | 18 cm | 10 mm | Flat, 20% thickness, flexible | 20 |
-| Fettuccine | 24 cm | 7 mm | Flat, 28% thickness, golden | 20 |
+| Udon | 24 cm | 10 mm | Knife-cut rounded square, uneven thickness; warm off-white, glossy-wet, strongly translucent | 32 |
+| Ramen | 22 cm | 5 mm | Nearly round, gently crinkled; kansui yellow with a satin sheen | 24 |
+| Spaghetti | 24 cm | 2.4 mm | Round; golden, semi-translucent, bronze-die micro-roughness | 12 |
+| Soba | 20 cm | 3.6 mm | Knife-cut square; grey-brown, more matte, dark buckwheat husk specks | 18 |
+| Rice Ribbon | 18 cm | 10 mm | Flat (20% thickness) with softened edges; milky and very translucent | 20 |
+| Fettuccine | 24 cm | 7 mm | Flat (28% thickness) with softened edges; egg-yellow, slightly rough | 20 |
 
 These are editable, art-directed examples. Thin spaghetti and soba can require more than the 24-step runtime ceiling; the sidebar reports that limit, and their fall may be speed-clamped. Udon is the preferred live-preview starting point.
 
 Ribbon profiles change the visible cross-section. Collision still uses a round envelope at the full width, so ribbon stacks can look more separated than their visible thickness implies. **Smooth Surface** rounds the displayed curve between simulation points without increasing the physics point count. It adds mesh cost and can slightly overshoot the sampled collision shape. Disable it to inspect the exact simulated polyline.
+
+### Material and surface
+
+Each type has its own **Noodle Box - <Type>** material (built in `noodle_box/materials.py`, values in `LOOKS` in `noodle_box/presets.py`). It is a Principled BSDF made to read as cooked starch rather than plastic:
+
+- **Random-walk subsurface** with a per-type mean free path: thin parts, edges and backlit strands glow, and shadows between strands stay warm.
+- A **starch-water film** on the Coat layer (IOR 1.33, low roughness). Its strength wanders in centimetre patches and per strand, so some areas are wet and sharp while others have dried to satin. The film follows only the broad undulation of the noodle, not the fine relief beneath it.
+- **Colour variation** at low frequency within each strand and between strands (from `np_id`), plus paler flour/starch blotches and tiny trapped bubbles.
+- **Micro relief** by bump: striations along the strand, shallow dimples, soft millimetre-scale lumps and fine grit (strong on bronze-die spaghetti). Soba adds dark husk specks. Cut faces are drier, rougher and paler than the sides.
+
+All texture coordinates come from attributes the solver writes on the display mesh, so detail is fixed to the noodle and does not swim as strands move: `nb_prof` (position in the cross-section, metres), `nb_along` (arc length from the strand start, metres), `nb_end` (distance to the nearer cut end, metres) and `np_id`. Cycles is the reference. EEVEE renders the same network, with EEVEE's own subsurface instead of random walk, so translucency is softer there. Materials saved by an older version are rebuilt automatically.
+
+The display surface also takes these **Noodles** inputs, which are display only. They are applied after the simulation zone, so they never move simulated points or change contacts:
+
+| Input | Effect |
+| --- | --- |
+| Profile Squareness | Round (0) towards a rounded square (1), as in knife-cut udon and soba. With Profile Aspect below 1 it gives flat ribbons with softened edges |
+| Waviness | Crinkle along the strand, as in wavy ramen. Use with Smooth Surface; on the raw polyline it is coarsely sampled |
+| Thickness Variation | Slow, uneven thickness along each strand |
+| End Softness | Rounded fillet on each cut end instead of a sharp flat cap, as a fraction of the radius; the two ends of a strand differ slightly |
+| Render Faces | Tube sides used in final renders (default 24). The viewport keeps the cheaper Profile Faces, and Smooth Surface uses 6 instead of 3 samples per segment in renders |
+
+The rounded-square corners extend slightly past the round collision envelope, and crinkles and thickness variation are not seen by collisions, so close contacts can show small overlaps.
 
 The existing Fast / Balanced / Quality shortcuts remain available separately. They change thickness and solver budget; they are not noodle type selections.
 
@@ -141,7 +164,8 @@ blender --background --factory-startup --python-exit-code 1 --python noodle_phys
 Source layout:
 
 - `noodle_box/solver.py`: Geometry Nodes solver, controls, and operators.
-- `noodle_box/presets.py`: noodle type settings and materials.
+- `noodle_box/presets.py`: noodle type settings and per-type looks.
+- `noodle_box/materials.py`: cooked-noodle shader networks.
 - `noodle_box/demo.py`: procedural bowl and studio scene.
 - `noodle_box/blender_manifest.toml`: Blender extension metadata.
 - `tools/build_addon.py`: build the distributable ZIP with Python's standard library.
