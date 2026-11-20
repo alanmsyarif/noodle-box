@@ -21,11 +21,11 @@ Choose a type in the sidebar's **Noodle library**. **Apply Type** updates dimens
 
 | Type | Length | Width | Cross-section and look | Suggested count |
 | --- | ---: | ---: | --- | ---: |
-| Udon | 24 cm | 10 mm | Knife-cut rounded square, uneven thickness; warm off-white, glossy-wet, strongly translucent | 32 |
-| Ramen | 22 cm | 5 mm | Nearly round, gently crinkled; kansui yellow with a satin sheen | 24 |
+| Udon | 24 cm | 10 mm | Knife-cut rounded square, uneven thickness; warm ivory, glassy-wet film over a faintly matte skin, strongly translucent with a warm glow | 32 |
+| Ramen | 22 cm | 5 mm | Nearly round, gently crinkled; kansui yellow, satin skin under crisp highlights | 24 |
 | Spaghetti | 24 cm | 2.4 mm | Round; golden, semi-translucent, bronze-die micro-roughness | 12 |
-| Soba | 20 cm | 3.6 mm | Knife-cut square; grey-brown, more matte, dark buckwheat husk specks | 18 |
-| Rice Ribbon | 18 cm | 10 mm | Flat (20% thickness) with softened edges; milky and very translucent | 20 |
+| Soba | 20 cm | 3.6 mm | Knife-cut square; taupe grey-brown with a faint olive cast, glossy from rinsing, fine sparse husk specks | 18 |
+| Rice Ribbon | 18 cm | 10 mm | Flat (20% thickness), uneven, with wandering edges and faint creases; milky, cloudy-translucent, oily gloss | 20 |
 | Fettuccine | 24 cm | 7 mm | Flat (28% thickness) with softened edges; egg-yellow, slightly rough | 20 |
 
 These are editable, art-directed examples. Thin spaghetti and soba can require more than the 24-step runtime ceiling; the sidebar reports that limit, and their fall may be speed-clamped. Udon is the preferred live-preview starting point.
@@ -39,7 +39,7 @@ Each type has its own **Noodle Box - <Type>** material (built in `noodle_box/mat
 - **Random-walk subsurface** with a per-type mean free path: thin parts, edges and backlit strands glow, and shadows between strands stay warm.
 - A **starch-water film** on the Coat layer (IOR 1.33, low roughness). Its strength wanders in centimetre patches and per strand, so some areas are wet and sharp while others have dried to satin. The film follows only the broad undulation of the noodle, not the fine relief beneath it.
 - **Colour variation** at low frequency within each strand and between strands (from `np_id`), plus paler flour/starch blotches and tiny trapped bubbles.
-- **Micro relief** by bump: striations along the strand, shallow dimples, soft millimetre-scale lumps and fine grit (strong on bronze-die spaghetti). Soba adds dark husk specks. Cut faces are drier, rougher and paler than the sides.
+- **Micro relief** by bump: striations along the strand, shallow dimples, broad low undulation, fine skin texture and grit (strong on bronze-die spaghetti). The water film carries its own tiny ripples, which give wet noodles their sharp specular sparkle. Soba adds fine husk specks; rice ribbons add occasional creases. Cut faces are drier, rougher and paler than the sides.
 
 All texture coordinates come from attributes the solver writes on the display mesh, so detail is fixed to the noodle and does not swim as strands move: `nb_prof` (position in the cross-section, metres), `nb_along` (arc length from the strand start, metres), `nb_end` (distance to the nearer cut end, metres) and `np_id`. Cycles is the reference. EEVEE renders the same network, with EEVEE's own subsurface instead of random walk, so translucency is softer there. Materials saved by an older version are rebuilt automatically.
 
@@ -52,6 +52,7 @@ The display surface also takes these **Noodles** inputs, which are display only.
 | Thickness Variation | Slow, uneven thickness along each strand |
 | End Softness | Rounded fillet on each cut end instead of a sharp flat cap, as a fraction of the radius; the two ends of a strand differ slightly |
 | Render Faces | Tube sides used in final renders (default 24). The viewport keeps the cheaper Profile Faces, and Smooth Surface uses 6 instead of 3 samples per segment in renders |
+| Edge Irregularity | Wandering cut edges and uneven thickness across the width, so ribbons are not perfect extrusions. Rice Ribbon uses 1, Fettuccine 0.35 |
 
 The rounded-square corners extend slightly past the round collision envelope, and crinkles and thickness variation are not seen by collisions, so close contacts can show small overlaps.
 

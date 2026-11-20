@@ -8,57 +8,71 @@
 #   waviness     crinkle amplitude, as a fraction of the diameter
 #   thickness_var  slow thickness variation along the strand (fraction)
 #   end_softness   fillet on the cut ends, as a fraction of the radius
+#   edge_irregularity  wandering edges and uneven thickness across ribbons
 LOOKS = {
-    # Plump, off-white, faintly warm; glossy-wet starch gel, strongly
-    # translucent; knife-cut rounded-square section with uneven thickness.
-    "udon": dict(colour=(0.70, 0.60, 0.42, 1.0), colour_b=(0.78, 0.69, 0.52, 1.0),
-                 tone=0.45, roughness=0.34, coat=(0.55, 1.0), coat_roughness=0.05,
-                 sss=1.0, sss_radius=(1.0, 0.86, 0.66), sss_scale=0.003,
-                 sss_anisotropy=0.3, blotch=0.45, striation=0.30, dimples=0.45,
-                 bubbles=0.35, grit=0.10, bump_distance=0.00016,
+    # Plump, warm ivory; very smooth glassy-wet film with fine sparkle over a
+    # faintly matte starchy skin; strongly translucent with a warm glow;
+    # knife-cut rounded-square section with uneven thickness.
+    "udon": dict(colour=(0.74, 0.62, 0.42, 1.0), colour_b=(0.80, 0.69, 0.50, 1.0),
+                 tone=0.4, roughness=0.5, coat=(0.75, 1.0), coat_roughness=0.025,
+                 sss=1.0, sss_radius=(1.0, 0.74, 0.46), sss_scale=0.003,
+                 sss_anisotropy=0.3, blotch=0.35, striation=0.2, dimples=0.25,
+                 bubbles=0.3, grit=0.08, lumps=0.25, micro=0.35, sparkle=0.6,
+                 bump_distance=0.00012, edge_irregularity=0.0,
                  squareness=0.55, waviness=0.0, thickness_var=0.05, end_softness=0.4),
-    # Kansui-yellow alkaline noodle: springy, satin rather than wet-glossy,
-    # gently crinkled.
+    # Kansui-yellow alkaline noodle: springy, satin skin under a crisp thin
+    # film, gently crinkled.
     "ramen": dict(colour=(0.62, 0.40, 0.10, 1.0), colour_b=(0.70, 0.48, 0.15, 1.0),
-                  tone=0.4, roughness=0.36, coat=(0.30, 0.65), coat_roughness=0.16,
+                  tone=0.4, roughness=0.42, coat=(0.40, 0.8), coat_roughness=0.06,
                   sss=0.85, sss_radius=(1.0, 0.62, 0.22), sss_scale=0.0016,
-                  sss_anisotropy=0.2, blotch=0.25, striation=0.35, dimples=0.15,
-                  bubbles=0.12, grit=0.12, bump_distance=0.00004, lumps=0.2,
+                  sss_anisotropy=0.2, blotch=0.2, striation=0.3, dimples=0.12,
+                  bubbles=0.1, grit=0.1, lumps=0.12, micro=0.4, sparkle=0.6,
+                  bump_distance=0.00004, edge_irregularity=0.0,
                   squareness=0.3, waviness=0.22, thickness_var=0.03, end_softness=0.35),
     # Durum pasta: golden, semi-translucent, bronze-die micro-roughness.
     "spaghetti": dict(colour=(0.70, 0.48, 0.17, 1.0), colour_b=(0.78, 0.56, 0.22, 1.0),
-                      tone=0.35, roughness=0.46, coat=(0.25, 0.7), coat_roughness=0.12,
+                      tone=0.35, roughness=0.46, coat=(0.25, 0.7), coat_roughness=0.08,
                       sss=0.85, sss_radius=(1.0, 0.6, 0.22), sss_scale=0.0010,
                       sss_anisotropy=0.2, blotch=0.2, striation=0.45, dimples=0.1,
-                      bubbles=0.05, grit=0.7, bump_distance=0.00006,
+                      bubbles=0.05, grit=0.7, lumps=0.15, micro=0.5, sparkle=0.4,
+                      bump_distance=0.00006, edge_irregularity=0.0,
                       squareness=0.0, waviness=0.0, thickness_var=0.02, end_softness=0.3),
-    # Buckwheat: grey-brown, more matte, dark husk specks; knife-cut square.
-    "soba": dict(colour=(0.14, 0.112, 0.085, 1.0), colour_b=(0.175, 0.142, 0.11, 1.0),
-                 tone=0.5, roughness=0.5, coat=(0.2, 0.55), coat_roughness=0.16,
-                 sss=0.35, sss_radius=(1.0, 0.8, 0.62), sss_scale=0.0008,
-                 sss_anisotropy=0.1, blotch=0.3, striation=0.35, dimples=0.2,
-                 bubbles=0.05, grit=0.35, specks=0.55,
-                 speck_colour=(0.03, 0.022, 0.016, 1.0), bump_distance=0.00003, lumps=0.25,
-                 squareness=0.7, waviness=0.0, thickness_var=0.04, end_softness=0.25),
-    # Fresh rice noodle sheet: milky, very translucent, slick.
-    "rice_ribbon": dict(colour=(0.87, 0.86, 0.81, 1.0), colour_b=(0.91, 0.90, 0.85, 1.0),
-                        tone=0.3, roughness=0.24, coat=(0.7, 1.0), coat_roughness=0.03,
-                        sss=1.0, sss_radius=(1.0, 0.92, 0.8), sss_scale=0.0018,
-                        sss_anisotropy=0.4, transmission=0.04, blotch=0.35, striation=0.15,
-                        dimples=0.3, bubbles=0.4, grit=0.05, bump_distance=0.00004,
-                        squareness=0.65, waviness=0.0, thickness_var=0.06, end_softness=0.18),
+    # Boiled buckwheat, rinsed cold: taupe grey-brown with a faint olive
+    # cast, glossy-wet, a little translucent at the edges, fine sparse husk
+    # specks; thin and knife-cut square.
+    "soba": dict(colour=(0.148, 0.126, 0.098, 1.0), colour_b=(0.18, 0.155, 0.12, 1.0),
+                 tone=0.45, roughness=0.42, coat=(0.6, 1.0), coat_roughness=0.04,
+                 sss=0.6, sss_radius=(1.0, 0.82, 0.55), sss_scale=0.0012,
+                 sss_anisotropy=0.2, blotch=0.2, striation=0.3, dimples=0.15,
+                 bubbles=0.05, grit=0.25, lumps=0.12, micro=0.5, sparkle=0.6,
+                 specks=0.22, speck_size=0.2, speck_colour=(0.035, 0.026, 0.018, 1.0),
+                 bump_distance=0.00003, edge_irregularity=0.0,
+                 squareness=0.8, waviness=0.0, thickness_var=0.04, end_softness=0.22),
+    # Cooked rice noodle sheet (ho fun / pho): semi-opaque milky white with a
+    # cloudy translucency, oily-glossy with broad soft highlights, uneven
+    # thickness, wandering cut edges and faint creases.
+    "rice_ribbon": dict(colour=(0.81, 0.79, 0.74, 1.0), colour_b=(0.86, 0.84, 0.79, 1.0),
+                        tone=0.3, roughness=0.26, coat=(0.85, 1.0), coat_roughness=0.09,
+                        sss=1.0, sss_radius=(1.0, 0.93, 0.82), sss_scale=0.0016,
+                        sss_anisotropy=0.3, transmission=0.0, blotch=0.3, striation=0.1,
+                        dimples=0.2, bubbles=0.35, grit=0.04, lumps=0.4, micro=0.3,
+                        sparkle=0.2, wrinkles=0.35, bump_distance=0.00006,
+                        edge_irregularity=1.0,
+                        squareness=0.65, waviness=0.0, thickness_var=0.08, end_softness=0.18),
     # Egg pasta ribbon: egg-yellow, slightly rough, less translucent.
     "fettuccine": dict(colour=(0.70, 0.45, 0.12, 1.0), colour_b=(0.77, 0.53, 0.17, 1.0),
                        tone=0.35, roughness=0.5, coat=(0.15, 0.5), coat_roughness=0.2,
                        sss=0.8, sss_radius=(1.0, 0.58, 0.2), sss_scale=0.0012,
                        sss_anisotropy=0.2, blotch=0.25, striation=0.3, dimples=0.15,
-                       bubbles=0.06, grit=0.6, bump_distance=0.00006,
+                       bubbles=0.06, grit=0.6, lumps=0.2, micro=0.5, sparkle=0.3,
+                       bump_distance=0.00006, edge_irregularity=0.35,
                        squareness=0.6, waviness=0.0, thickness_var=0.04, end_softness=0.2),
 }
 
 # Display-only solver inputs driven by a look (socket name -> look key).
 SURFACE_INPUTS = {"Profile Squareness": "squareness", "Waviness": "waviness",
-                  "Thickness Variation": "thickness_var", "End Softness": "end_softness"}
+                  "Thickness Variation": "thickness_var", "End Softness": "end_softness",
+                  "Edge Irregularity": "edge_irregularity"}
 
 NOODLE_TYPES = {
     "udon": dict(label="Udon", description="Thick, pale and soft; best for live playback",

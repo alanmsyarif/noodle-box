@@ -201,6 +201,7 @@ PARAMS = [
     ("Thickness Variation", "NodeSocketFloat", 0.03, 0.0, 0.3,    "FACTOR"),
     ("End Softness",    "NodeSocketFloat", 0.35,   0.0,   0.9,    "FACTOR"),
     ("Render Faces",    "NodeSocketInt",   24,     3,     64,     None),
+    ("Edge Irregularity", "NodeSocketFloat", 0.0,  0.0,   1.0,    "FACTOR"),
 ]
 
 
@@ -209,7 +210,7 @@ CONTROL_GROUPS = (
     ("Noodles", False, ("Noodle Count", "Noodle Length", "Noodle Radius",
                         "Length Variation", "Profile Faces", "Profile Aspect", "Smooth Surface", "Noodle Material",
                         "Profile Squareness", "Waviness", "Thickness Variation", "End Softness",
-                        "Render Faces")),
+                        "Render Faces", "Edge Irregularity")),
     ("Spawn", False, ("Fill Diameter", "Start Height", "Spawn Coil", "Seed")),
     ("Solver", False, ("Adaptive Substeps", "Substeps", "Iterations", "Gravity",
                        "Damping", "Contact Damping", "Stiffness", "Self Collision", "Friction", "Cohesion")),
@@ -232,6 +233,7 @@ DESCRIPTIONS = {
     "Thickness Variation": "Slow, uneven thickness along each strand, as in hand-cut noodles. Display only",
     "End Softness": "Rounds the cut ends instead of a sharp flat cap; fraction of the radius. Display only",
     "Render Faces": "Tube sides used for final renders; the viewport keeps Profile Faces. Display only",
+    "Edge Irregularity": "Wandering cut edges and uneven thickness across the width, for ribbons. Display only",
     "Fill Diameter": "Diameter of the spawn disc in metres",
     "Start Height": "Spawn origin above the local floor in metres; coils can extend below this",
     "Spawn Coil": "1 starts loose coils; 0 starts upright strands",
@@ -1202,13 +1204,62 @@ def build_group():
                   120, 20)
     scale = math("MULTIPLY", radius, math("MULTIPLY", thickness, fillet, 121, 18), 122, 17)
 
+    # The centreline rides onto each ring so the mesh pass below can push
+    # vertices radially; it is removed again afterwards.
+    shaped = store(shaped, "nb_axis", nd("GeometryNodeInputPosition", 108, 8).outputs["Position"],
+                   "FLOAT_VECTOR", 109, 7)
     to_mesh = nd("GeometryNodeCurveToMesh", 110, 7)
     plug(to_mesh.inputs["Curve"], shaped)
     plug(to_mesh.inputs["Profile Curve"], profile)
     plug(pick_in(to_mesh, "Scale"), scale)
     plug(to_mesh.inputs["Fill Caps"], True)
+
+    # Edge irregularity, for ribbons: the cut edges wander in and out along
+    # the strand and the sheet is unevenly thick across its width, instead
+    # of a perfect extrusion. Vertices move radially from their own ring
+    # centre: near the edges (|x| close to the half-width) by an edge noise,
+    # elsewhere by a thickness noise that varies across the width.
+    centre = named("nb_axis", "FLOAT_VECTOR", 110, 23)
+    radial = vmath("SUBTRACT", nd("GeometryNodeInputPosition", 110, 24).outputs["Position"],
+                   centre, 111, 23)
+    prof_x, _, _ = sep(named("nb_prof", "FLOAT_VECTOR", 110, 25), 111, 25)
+    safe_r = math("MAXIMUM", radius, 1e-9, 111, 26)
+    across = math("DIVIDE", math("ABSOLUTE", prof_x, None, 112, 25), safe_r, 113, 25)
+    edge_w = math("MINIMUM", math("MAXIMUM", math("DIVIDE", math("SUBTRACT", across, 0.55, 114, 25),
+                                                  0.45, 115, 25), 0.0, 116, 25), 1.0, 117, 25)
+    edge_w = math("MULTIPLY", edge_w, edge_w, 118, 25)
+    mesh_along = named("nb_along", "FLOAT", 110, 27)
+    mesh_id = named(ATTR_ID, "INT", 110, 28)
+    fray = nd("ShaderNodeTexNoise", 112, 27, noise_dimensions="2D")
+    plug(fray.inputs["Vector"], xyz(math("DIVIDE", mesh_along, math("MULTIPLY", safe_r, 1.3, 112, 29),
+                                         113, 28),
+                                    math("MULTIPLY", mesh_id, NOODLE_SPREAD, 113, 29), 0.0, 114, 28))
+    plug(fray.inputs["Detail"], 2.0)
+    plug(fray.inputs["Roughness"], 0.55)
+    uneven = nd("ShaderNodeTexNoise", 112, 30, noise_dimensions="3D")
+    plug(uneven.inputs["Vector"], xyz(math("DIVIDE", prof_x, math("MULTIPLY", safe_r, 0.45, 113, 31),
+                                           114, 31),
+                                      math("DIVIDE", mesh_along, math("MULTIPLY", safe_r, 1.6, 113, 32),
+                                           114, 32),
+                                      math("MULTIPLY", mesh_id, NOODLE_SPREAD, 113, 33), 115, 31))
+    plug(uneven.inputs["Detail"], 2.0)
+    wobble = math("ADD",
+                  math("MULTIPLY", math("MULTIPLY", math("SUBTRACT", fray.outputs["Factor"], 0.5, 115, 27),
+                                        0.22, 116, 27), edge_w, 117, 27),
+                  math("MULTIPLY", math("MULTIPLY", math("SUBTRACT", uneven.outputs["Factor"], 0.5, 116, 30),
+                                        0.6, 117, 30),
+                       math("SUBTRACT", 1.0, edge_w, 117, 31), 118, 30), 119, 27)
+    rough_edges = set_position(
+        to_mesh.outputs["Mesh"],
+        vmath("ADD", centre,
+              vmath("SCALE", radial,
+                    math("ADD", 1.0, math("MULTIPLY", wobble, P["Edge Irregularity"], 120, 27),
+                         121, 27), 120, 23), 121, 23), 122, 22)
+    drop_axis = nd("GeometryNodeRemoveAttribute", 123, 22)
+    plug(drop_axis.inputs["Geometry"], rough_edges)
+    plug(drop_axis.inputs["Name"], "nb_axis")
     smooth = nd("GeometryNodeSetShadeSmooth", 111, 7, domain="FACE")
-    plug(smooth.inputs["Mesh"], to_mesh.outputs["Mesh"])
+    plug(smooth.inputs["Mesh"], drop_axis.outputs["Geometry"])
     plug(smooth.inputs["Shade Smooth"], True)
     set_mat = nd("GeometryNodeSetMaterial", 112, 7)
     plug(set_mat.inputs["Geometry"], smooth.outputs["Mesh"])
