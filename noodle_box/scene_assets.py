@@ -512,12 +512,12 @@ def chopstick_material():
     fibre = n.noise(n.scale(obj, (40.0, 3000.0, 3000.0)), 1.0, 3.0, 0.6).outputs["Fac"]
     tone = n.noise(n.scale(obj, (25.0, 200.0, 200.0)), 1.0, 2.0).outputs["Fac"]
     col = n.mix(n.map_range(tone, 0.3, 0.7), (0.085, 0.042, 0.019, 1), (0.13, 0.066, 0.030, 1))
-    col = n.mix(n.math("MULTIPLY", lines, 0.7), col, (0.030, 0.015, 0.007, 1))
+    col = n.mix(n.math("MULTIPLY", lines, 0.85), col, (0.022, 0.011, 0.005, 1))
     col = n.mix(n.math("MULTIPLY", n.map_range(fibre, 0.55, 0.8), 0.35), col, (0.16, 0.09, 0.045, 1))
     n.link(col, bsdf.inputs["Base Color"])
-    n.link(n.map_range(fibre, 0.3, 0.7, 0.30, 0.42), bsdf.inputs["Roughness"])
-    bsdf.inputs["Coat Weight"].default_value = 0.15
-    bsdf.inputs["Coat Roughness"].default_value = 0.3
+    # Oiled, not lacquered: a soft satin sheen, no plastic highlight.
+    n.link(n.map_range(fibre, 0.3, 0.7, 0.48, 0.62), bsdf.inputs["Roughness"])
+    bsdf.inputs["Specular IOR Level"].default_value = 0.35
     height = n.math("ADD", n.math("MULTIPLY", lines, -0.4), fibre)
     n.link(n.bump(height, 0.5, 0.00003), bsdf.inputs["Normal"])
     return mat
