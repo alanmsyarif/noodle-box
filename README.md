@@ -19,14 +19,25 @@ For development, `noodle_physics.py` remains a compatibility launcher. Keep it n
 
 Choose a type in the sidebar's **Noodle library**. **Apply Type** updates dimensions, flexibility, cohesion, material, and profile shape, then restarts the selected pile. Collider assignments and seed are preserved. Turn off **Use suggested strand count** to preserve your count too.
 
-| Type | Length | Width | Profile | Young's modulus | Drape length L_g | Friction | Suggested count |
-| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| Udon | 24 cm | 10 mm | Round, pale, soft | 100 kPa | 39 mm | 0.30 | 32 |
-| Ramen | 22 cm | 5 mm | Round, golden, firmer | 250 kPa | 34 mm | 0.30 | 24 |
-| Spaghetti | 24 cm | 2.4 mm | Fine round pasta | 2 MPa | 41 mm | 0.25 | 12 |
-| Soba | 20 cm | 3.6 mm | Darker matte buckwheat style | 300 kPa | 29 mm | 0.35 | 18 |
-| Rice Ribbon | 18 cm | 10 mm | Flat, 20% thickness, flexible | 150 kPa | 18 mm* | 0.25 | 20 |
-| Fettuccine | 24 cm | 7 mm | Flat, 28% thickness, golden | 1 MPa | 31 mm* | 0.30 | 20 |
+| Type | Length | Width | Cross-section and look | Suggested count |
+| --- | ---: | ---: | --- | ---: |
+| Udon | 24 cm | 10 mm | Knife-cut rounded square, uneven thickness; warm ivory, glassy-wet film over a faintly matte skin, strongly translucent with a warm glow | 32 |
+| Ramen | 22 cm | 5 mm | Nearly round, gently crinkled; kansui yellow, satin skin under crisp highlights | 24 |
+| Spaghetti | 24 cm | 2.4 mm | Round; golden, semi-translucent, bronze-die micro-roughness | 12 |
+| Soba | 20 cm | 3.6 mm | Knife-cut square; taupe grey-brown with a faint olive cast, glossy from rinsing, fine sparse husk specks | 18 |
+| Rice Ribbon | 18 cm | 10 mm | Flat (20% thickness), uneven, with wandering edges and faint creases; milky, cloudy-translucent, oily gloss | 20 |
+| Fettuccine | 24 cm | 7 mm | Flat (28% thickness) with softened edges; egg-yellow, slightly rough | 20 |
+
+Physical behaviour:
+
+| Type | Young's modulus | Drape length L_g | Friction |
+| --- | ---: | ---: | ---: |
+| Udon | 100 kPa | 39 mm | 0.30 |
+| Ramen | 250 kPa | 34 mm | 0.30 |
+| Spaghetti | 2 MPa | 41 mm | 0.25 |
+| Soba | 300 kPa | 29 mm | 0.35 |
+| Rice Ribbon | 150 kPa | 18 mm* | 0.25 |
+| Fettuccine | 1 MPa | 31 mm* | 0.30 |
 
 The drape length is the elasto-gravity length L_g = (E I / (rho g A))^(1/3), with density 1050 kg/m^3: roughly the radius a strand curves over when it hangs across an edge. *Ribbons bend across their thin side, so their modulus is scaled by 4/3 x aspect^2 for the round-section solver; for Rice Ribbon that falls below the 10 kPa floor of the Stiffness range and is clamped there.
 
@@ -34,13 +45,46 @@ These are editable, art-directed examples. Thin spaghetti and soba can require m
 
 Ribbon profiles change the visible cross-section. Collision still uses a round envelope at the full width, so ribbon stacks can look more separated than their visible thickness implies. **Smooth Surface** rounds the displayed curve between simulation points without increasing the physics point count. It adds mesh cost and can slightly overshoot the sampled collision shape. Disable it to inspect the exact simulated polyline.
 
+### Material and surface
+
+Each type has its own **Noodle Box - <Type>** material (built in `noodle_box/materials.py`, values in `LOOKS` in `noodle_box/presets.py`). It is a Principled BSDF made to read as cooked starch rather than plastic:
+
+- **Random-walk subsurface** with a per-type mean free path: thin parts, edges and backlit strands glow, and shadows between strands stay warm.
+- A **starch-water film** on the Coat layer (IOR 1.33, low roughness). Its strength wanders in centimetre patches and per strand, so some areas are wet and sharp while others have dried to satin. The film follows only the broad undulation of the noodle, not the fine relief beneath it.
+- **Colour variation** at low frequency within each strand and between strands (from `np_id`), plus paler flour/starch blotches and tiny trapped bubbles.
+- **Micro relief** by bump: striations along the strand, shallow dimples, broad low undulation, fine skin texture and grit (strong on bronze-die spaghetti). The water film carries its own tiny ripples, which give wet noodles their sharp specular sparkle. Soba adds fine husk specks; rice ribbons add occasional creases. Cut faces are drier, rougher and paler than the sides.
+
+All texture coordinates come from attributes the solver writes on the display mesh, so detail is fixed to the noodle and does not swim as strands move: `nb_prof` (position in the cross-section, metres), `nb_along` (arc length from the strand start, metres), `nb_end` (distance to the nearer cut end, metres) and `np_id`. Cycles is the reference. EEVEE renders the same network, with EEVEE's own subsurface instead of random walk, so translucency is softer there. Materials saved by an older version are rebuilt automatically.
+
+The display surface also takes these **Noodles** inputs, which are display only. They are applied after the simulation zone, so they never move simulated points or change contacts:
+
+| Input | Effect |
+| --- | --- |
+| Profile Squareness | Round (0) towards a rounded square (1), as in knife-cut udon and soba. With Profile Aspect below 1 it gives flat ribbons with softened edges |
+| Waviness | Crinkle along the strand, as in wavy ramen. Use with Smooth Surface; on the raw polyline it is coarsely sampled |
+| Thickness Variation | Slow, uneven thickness along each strand |
+| End Softness | Rounded fillet on each cut end instead of a sharp flat cap, as a fraction of the radius; the two ends of a strand differ slightly |
+| Render Faces | Tube sides used in final renders (default 24). The viewport keeps the cheaper Profile Faces, and Smooth Surface uses 6 instead of 3 samples per segment in renders |
+| Edge Irregularity | Wandering cut edges and uneven thickness across the width, so ribbons are not perfect extrusions. Rice Ribbon uses 1, Fettuccine 0.35 |
+
+The rounded-square corners extend slightly past the round collision envelope, and crinkles and thickness variation are not seen by collisions, so close contacts can show small overlaps.
+
 The existing Fast / Balanced / Quality shortcuts remain available separately. They change thickness and solver budget; they are not noodle type selections.
 
 ## Bowl demo
 
-Click **Create Bowl Demo** to create a **separate scene**, leaving your current scene intact. It contains 24 Udon strands, a watertight ceramic bowl collider, a studio surface, three lights, a camera, and timeline markers. Play forward from frame 1. Use the scene selector to return to your previous scene.
+Click **Create Bowl Demo** to create a **separate scene**, leaving your current scene intact. It is set up like a food photograph rather than a studio test, and is still created instantly (nothing is baked until you play):
 
-Alternatively open [noodle_box_demo.blend](demo/noodle_box_demo.blend). It includes the playable setup and a **Finished Preview** scene containing a static frame-100 snapshot, so the finished example is visible without rebuilding a cache. The static preview is a mesh reference, not another live solver. A short guide is included in the file's Text Editor.
+- **Bowl**: a thrown stoneware donburi, 19.9 cm across and 8.3 cm tall, with 6-9 mm walls, a rounded lip and a trimmed foot ring. A slight oval, rim undulation and radial ripple give it a hand-made wobble. It is one closed, watertight mesh and is the noodle **Collider**; walls are kept thicker than about 1.2 noodle radii so the voxelised distance field cannot leak.
+- **Glaze**: a procedural iron (kaki/tenmoku) glaze that pools dark in the well, breaks to rust over the lip and throwing ridges, with hare's-fur streaks, iron spots, pinholes and an orange-peel surface. The foot is raw, kiln-toasted clay below a wavy glaze line.
+- **Table**: procedural oiled oak boards with flat-sawn growth rings, pores, ray flecks, seams and wear. The 85 mm lens never sees an edge or horizon.
+- **Light**: a 1.1 x 0.8 m window key behind-left (110 W area light), a bounce card front-right, a black negative-fill flag and a weak overhead room fill. The glaze reflects a separate glossy-only window pane with mullions and sheer-curtain folds, and the world is a dim room gradient.
+- **Camera**: 85 mm on full frame, about 34 degrees above the table, f/3.2 focused on the *Focus - front of noodles* empty, 3:2 frame. Cycles with adaptive sampling and denoising, AgX Medium High Contrast, plus a compositor lens finish (soft vignette, fine grain).
+- **Props**: lacquered chopsticks laid on a glazed hashioki as a leading line.
+
+The pile uses 24 Udon strands, Fill Diameter 0.09 m, Start Height 0.12 m and **Spawn Coil 0.3**. Fully coiled spawns reach about 17 cm from the axis and drape over the rim; at 0.3 every strand lands in the bowl. Re-applying a noodle type restores Spawn Coil 1. Play forward from frame 1. Use the scene selector to return to your previous scene. Set assets live in `noodle_box/scene_assets.py`.
+
+Alternatively open [noodle_box_demo.blend](demo/noodle_box_demo.blend). It includes the playable setup and a **Finished Preview** scene containing a static frame-100 snapshot garnished with sliced scallions, so the finished example is visible without rebuilding a cache. The static preview is a mesh reference, not another live solver. `tools/build_demo.py` renders it at 1600 x 1067; set `NOODLE_DEMO_SAMPLES`, `NOODLE_DEMO_SIZE` (for example `750x500`) or `NOODLE_DEMO_THREADS` for a quicker check. A short guide is included in the file's Text Editor.
 
 ![Udon bowl demo](demo/udon_bowl.png)
 
@@ -174,8 +218,10 @@ blender --background --factory-startup --python-exit-code 1 --python noodle_phys
 Source layout:
 
 - `noodle_box/solver.py`: Geometry Nodes solver, controls, and operators.
-- `noodle_box/presets.py`: noodle type settings and materials.
-- `noodle_box/demo.py`: procedural bowl and studio scene.
+- `noodle_box/presets.py`: noodle type settings and per-type looks.
+- `noodle_box/materials.py`: cooked-noodle shader networks.
+- `noodle_box/demo.py`: creates the bowl demo scene.
+- `noodle_box/scene_assets.py`: procedural bowl, glaze, oak table, lights, camera, props and garnish.
 - `noodle_box/blender_manifest.toml`: Blender extension metadata.
 - `tools/build_addon.py`: build the distributable ZIP with Python's standard library.
 - `tools/build_demo.py`: generate the `.blend` and rendered preview inside Blender.

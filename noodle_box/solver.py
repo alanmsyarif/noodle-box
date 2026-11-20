@@ -71,6 +71,7 @@ def parse_mode_args(argv):
 
 
 import bpy
+from . import materials
 from .presets import NOODLE_TYPES, TYPE_ITEMS
 
 NG_NAME = "Noodle Physics"
@@ -258,13 +259,22 @@ PARAMS = [
     ("Friction",        "NodeSocketFloat", 0.3,    0.0,   1.0,    "FACTOR"),
     ("Self Collision",  "NodeSocketFloat", 1.0,    0.0,   1.0,    "FACTOR"),
     ("Cohesion",        "NodeSocketFloat", 0.15,   0.0,   1.0,    "FACTOR"),
+    # Display-only surface shape. None of these reach the simulation zone.
+    ("Profile Squareness", "NodeSocketFloat", 0.0, 0.0,   1.0,    "FACTOR"),
+    ("Waviness",        "NodeSocketFloat", 0.0,    0.0,   1.0,    "FACTOR"),
+    ("Thickness Variation", "NodeSocketFloat", 0.03, 0.0, 0.3,    "FACTOR"),
+    ("End Softness",    "NodeSocketFloat", 0.35,   0.0,   0.9,    "FACTOR"),
+    ("Render Faces",    "NodeSocketInt",   24,     3,     64,     None),
+    ("Edge Irregularity", "NodeSocketFloat", 0.0,  0.0,   1.0,    "FACTOR"),
 ]
 
 
 # Shared ordering for the modifier and sidebar; collider details start folded.
 CONTROL_GROUPS = (
     ("Noodles", False, ("Noodle Count", "Noodle Length", "Noodle Radius",
-                        "Length Variation", "Profile Faces", "Profile Aspect", "Smooth Surface", "Noodle Material")),
+                        "Length Variation", "Profile Faces", "Profile Aspect", "Smooth Surface", "Noodle Material",
+                        "Profile Squareness", "Waviness", "Thickness Variation", "End Softness",
+                        "Render Faces", "Edge Irregularity")),
     ("Spawn", False, ("Fill Diameter", "Start Height", "Spawn Coil", "Seed")),
     ("Solver", False, ("Adaptive Substeps", "Substeps", "Iterations", "Gravity",
                        "Damping", "Contact Damping", "Stiffness", "Self Collision", "Friction", "Cohesion")),
@@ -282,6 +292,12 @@ DESCRIPTIONS = {
     "Profile Aspect": "Thickness divided by width: 1 round, smaller values flatten into ribbons. Collisions use the full width",
     "Smooth Surface": "Round the displayed curve between simulation points; adds surface detail without increasing solver points",
     "Noodle Material": "Surface material for this pile; noodle type presets supply their own colours",
+    "Profile Squareness": "Cross-section from round (0) towards a rounded square (1), as knife-cut udon and soba. Display only",
+    "Waviness": "Crinkle along the strand, as in wavy ramen. Display only; the simulated centreline is unchanged",
+    "Thickness Variation": "Slow, uneven thickness along each strand, as in hand-cut noodles. Display only",
+    "End Softness": "Rounds the cut ends instead of a sharp flat cap; fraction of the radius. Display only",
+    "Render Faces": "Tube sides used for final renders; the viewport keeps Profile Faces. Display only",
+    "Edge Irregularity": "Wandering cut edges and uneven thickness across the width, for ribbons. Display only",
     "Fill Diameter": "Diameter of the spawn disc in metres",
     "Start Height": "Spawn origin above the local floor in metres; coils can extend below this",
     "Spawn Coil": "How much each strand meanders when dropped: 1 lazy curves, 0 upright straight rods",
@@ -307,63 +323,14 @@ DESCRIPTIONS = {
 
 
 def ensure_material():
-    """One shared noodle material, reused if it already exists.
+    """One shared noodle material, reused while it is current.
 
-    Every strand is shaded slightly differently, driven by the np_id attribute
-    the solver leaves on the mesh. Uniform pasta reads as plastic: real cooked
-    spaghetti varies in tone and in how wet each strand is, and with a hundred
-    of them touching, that variation is most of what sells it.
+    The shader itself lives in materials.py: translucent random-walk
+    subsurface, a patchy starch-water coat, per-strand tone from np_id and
+    micro relief anchored to the surface attributes the surface section
+    writes. A material saved by an older add-on is rebuilt in place.
     """
-    mat = bpy.data.materials.get(MAT_NAME)
-    if mat:
-        return mat
-    mat = bpy.data.materials.new(MAT_NAME)  # already node-backed in 5.x
-    tree = mat.node_tree
-    bsdf = tree.nodes.get("Principled BSDF")
-    if not bsdf:
-        return mat
-
-    def put(name, value):
-        """Socket names move between releases; set only what exists."""
-        if name in bsdf.inputs:
-            bsdf.inputs[name].default_value = value
-
-    put("Base Color", (0.94, 0.80, 0.44, 1.0))
-    put("Roughness", 0.35)
-    put("Subsurface Weight", 0.22)
-    put("Subsurface Radius", (0.0009, 0.00055, 0.00025))
-    put("Subsurface Scale", 1.0)
-    put("IOR", 1.42)
-
-    # np_id -> white noise -> one uncorrelated random per strand.
-    attr = tree.nodes.new("ShaderNodeAttribute")
-    attr.attribute_type = "GEOMETRY"
-    attr.attribute_name = ATTR_ID
-    attr.location = (-900, 0)
-    noise = tree.nodes.new("ShaderNodeTexWhiteNoise")
-    noise.noise_dimensions = "1D"
-    noise.location = (-700, 0)
-    tree.links.new(attr.outputs["Fac"], noise.inputs["W"])
-
-    ramp = tree.nodes.new("ShaderNodeValToRGB")
-    ramp.location = (-500, 120)
-    ramp.color_ramp.elements[0].color = (0.86, 0.70, 0.38, 1.0)   # paler, drier
-    ramp.color_ramp.elements[1].color = (0.98, 0.87, 0.55, 1.0)   # richer, wetter
-    tree.links.new(noise.outputs["Value"], ramp.inputs["Fac"])
-    if "Base Color" in bsdf.inputs:
-        tree.links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
-
-    # Wetter strands are glossier. Same random, remapped.
-    rough = tree.nodes.new("ShaderNodeMapRange")
-    rough.location = (-500, -160)
-    rough.inputs["From Min"].default_value = 0.0
-    rough.inputs["From Max"].default_value = 1.0
-    rough.inputs["To Min"].default_value = 0.22
-    rough.inputs["To Max"].default_value = 0.45
-    tree.links.new(noise.outputs["Value"], rough.inputs["Value"])
-    if "Roughness" in bsdf.inputs:
-        tree.links.new(rough.outputs["Result"], bsdf.inputs["Roughness"])
-    return mat
+    return materials.ensure(MAT_NAME)
 
 
 def build_group():
@@ -1688,13 +1655,54 @@ def build_group():
     plug(sim_out.inputs["Geometry"], sub_out.outputs["Geometry"])
 
     # -------------------------------------------------------------- surface
-    circle = nd("GeometryNodeCurvePrimitiveCircle", 69, 3, mode="RADIUS")
-    plug(circle.inputs["Resolution"], P["Profile Faces"])
-    plug(circle.inputs["Radius"], P["Noodle Radius"])
-    profile = nd("GeometryNodeTransform", 69, 4)
-    plug(profile.inputs["Geometry"], circle.outputs["Curve"])
-    plug(profile.inputs["Scale"], xyz(1.0, P["Profile Aspect"], 1.0, 68, 4))
-    to_mesh = nd("GeometryNodeCurveToMesh", 70, 1)
+    # Display only. Everything below reads the simulated curves after the
+    # simulation zone and never feeds back into it, so none of these inputs
+    # can change the physics. Columns from 80 on keep it clear of the solver.
+    #
+    # Attributes written for the shader (see materials.py), all anchored to
+    # the noodle so textures do not swim as strands move:
+    #   nb_prof   cross-section position in metres (x across, y thickness)
+    #   nb_along  arc length from the strand start in metres
+    #   nb_end    distance to the nearer cut end in metres (0 on the caps)
+    is_view = nd("GeometryNodeIsViewport", 80, 0).outputs["Is Viewport"]
+
+    def choose(switch, if_true, if_false, kind, col, row):
+        n = nd("GeometryNodeSwitch", col, row, input_type=kind)
+        plug(n.inputs["Switch"], switch)
+        plug(n.inputs["True"], if_true)
+        plug(n.inputs["False"], if_false)
+        return n.outputs["Output"]
+
+    radius = P["Noodle Radius"]
+
+    # Profile: a unit superellipse, |x|^n + |y|^n = 1. Squareness 0 is the
+    # old circle; towards 1 it becomes the rounded square of knife-cut udon
+    # and soba, or with Aspect < 1 a flat ribbon with softened edges. Final
+    # renders use Render Faces so close-up silhouettes stay round; the
+    # viewport keeps the cheaper Profile Faces.
+    faces = choose(is_view, P["Profile Faces"],
+                   math("MAXIMUM", P["Profile Faces"], P["Render Faces"], 80, 1),
+                   "INT", 81, 1)
+    circle = nd("GeometryNodeCurvePrimitiveCircle", 82, 1, mode="RADIUS")
+    plug(circle.inputs["Resolution"], faces)
+    plug(circle.inputs["Radius"], 1.0)
+    exponent = math("SUBTRACT", 1.0, math("MULTIPLY", P["Profile Squareness"], 0.75, 80, 3),
+                    81, 3)
+    ux, uy, _ = sep(nd("GeometryNodeInputPosition", 80, 4).outputs["Position"], 81, 4)
+
+    def superellipse(c, col, row):
+        return math("MULTIPLY", math("SIGN", c, None, col, row),
+                    math("POWER", math("ABSOLUTE", c, None, col, row + 1), exponent,
+                         col + 1, row + 1), col + 1, row)
+
+    prof_pos = xyz(superellipse(ux, 82, 3),
+                   math("MULTIPLY", superellipse(uy, 82, 5), P["Profile Aspect"], 84, 5),
+                   0.0, 85, 4)
+    profile = set_position(circle.outputs["Curve"], prof_pos, 86, 1)
+    profile = store(profile, "nb_prof",
+                    vmath("SCALE", nd("GeometryNodeInputPosition", 86, 3).outputs["Position"],
+                          radius, 87, 3), "FLOAT_VECTOR", 87, 1)
+
     # Drop the solver's working data before the surface. Curve to Mesh
     # interpolates every attribute it is handed onto every vertex of every
     # tube, so leaving nine scratch attributes attached meant carrying and
@@ -1702,31 +1710,164 @@ def build_group():
     # np_vel survive on purpose - see the shader notes in the README.
     clean = sim_out.outputs["Geometry"]
     for i, attr in enumerate(SCRATCH_ATTRS):
-        strip = nd("GeometryNodeRemoveAttribute", 69 + i, 1)
+        strip = nd("GeometryNodeRemoveAttribute", 80 + i, 7)
         plug(strip.inputs["Geometry"], clean)
         plug(strip.inputs["Name"], attr)
         clean = strip.outputs["Geometry"]
-    bezier = nd("GeometryNodeCurveSplineType", 77, 2, spline_type="BEZIER")
+    bezier = nd("GeometryNodeCurveSplineType", 88, 8, spline_type="BEZIER")
     plug(bezier.inputs["Curve"], clean)
-    handles = nd("GeometryNodeCurveSetHandles", 78, 2, handle_type="AUTO")
+    handles = nd("GeometryNodeCurveSetHandles", 89, 8, handle_type="AUTO")
     plug(handles.inputs["Curve"], bezier.outputs["Curve"])
-    resolution = nd("GeometryNodeSetSplineResolution", 79, 2)
+    resolution = nd("GeometryNodeSetSplineResolution", 90, 8)
     plug(resolution.inputs["Geometry"], handles.outputs["Curve"])
-    plug(resolution.inputs["Resolution"], 3)
-    surface = nd("GeometryNodeSwitch", 80, 2, input_type="GEOMETRY")
+    plug(resolution.inputs["Resolution"], choose(is_view, 3, 6, "INT", 89, 9))
+    surface = nd("GeometryNodeSwitch", 91, 7, input_type="GEOMETRY")
     plug(surface.inputs["Switch"], P["Smooth Surface"])
     plug(surface.inputs["False"], clean)
     plug(surface.inputs["True"], resolution.outputs["Geometry"])
-    plug(to_mesh.inputs["Curve"], surface.outputs["Output"])
-    plug(to_mesh.inputs["Profile Curve"], profile.outputs["Geometry"])
+
+    # Make the evaluated (smoothed) points real, so the per-point shape
+    # fields below have the full display resolution, then add extra points
+    # on the first and last segment only, for the rounded cut ends.
+    evaluated = nd("GeometryNodeResampleCurve", 92, 7)
+    plug(evaluated.inputs["Curve"], surface.outputs["Output"])
+    pick_in(evaluated, "Mode").default_value = "Evaluated"
+    sp_index = nd("GeometryNodeSplineParameter", 92, 9).outputs["Index"]
+    sp_count = nd("GeometryNodeSplineLength", 92, 10).outputs["Point Count"]
+    end_segment = math("MAXIMUM", math("LESS_THAN", sp_index, 0.5, 93, 9),
+                       math("GREATER_THAN", sp_index,
+                            math("SUBTRACT", sp_count, 2.5, 93, 10), 94, 10), 95, 9)
+    soft_on = math("GREATER_THAN", P["End Softness"], 0.0, 94, 11)
+    ends = nd("GeometryNodeSubdivideCurve", 96, 7)
+    plug(ends.inputs["Curve"], evaluated.outputs["Curve"])
+    plug(ends.inputs["Cuts"], math("MULTIPLY", math("MULTIPLY", end_segment, soft_on, 95, 10),
+                                   choose(is_view, 4, 10, "INT", 95, 11), 96, 9))
+
+    along = nd("GeometryNodeSplineParameter", 97, 9).outputs["Length"]
+    total = nd("GeometryNodeSplineLength", 97, 10).outputs["Length"]
+    to_end = math("MINIMUM", along, math("SUBTRACT", total, along, 98, 10), 99, 9)
+    shaped = store(ends.outputs["Curve"], "nb_along", along, "FLOAT", 98, 7)
+    shaped = store(shaped, "nb_end", to_end, "FLOAT", 99, 7)
+    strand = named(ATTR_ID, "INT", 100, 9)
+    along_n = named("nb_along", "FLOAT", 100, 10)
+    end_n = named("nb_end", "FLOAT", 100, 11)
+
+    # Crinkle: a wandering wave across the strand. Its wavelength follows
+    # the diameter, its phase drifts with a slow noise so it is not a sine.
+    # It moves only the displayed tube; the simulated centreline is intact.
+    wavelength = math("MULTIPLY", radius, 7.0, 101, 12)
+    cycles = math("DIVIDE", along_n, math("MAXIMUM", wavelength, 1e-9, 102, 12), 103, 12)
+    drift = nd("ShaderNodeTexNoise", 104, 12, noise_dimensions="2D")
+    plug(drift.inputs["Vector"], xyz(math("MULTIPLY", cycles, 0.3, 104, 13),
+                                     math("MULTIPLY", strand, NOODLE_SPREAD, 104, 14), 0.0, 105, 13))
+    phase = math("ADD", math("MULTIPLY", cycles, tau, 105, 12),
+                 math("ADD", math("MULTIPLY", drift.outputs["Factor"], 9.0, 106, 13),
+                      math("MULTIPLY", strand, 2.399, 106, 14), 107, 13), 107, 12)
+    amplitude = math("MULTIPLY", P["Waviness"], math("MULTIPLY", radius, 0.9, 101, 14), 102, 14)
+    normal = nd("GeometryNodeInputNormal", 101, 15).outputs["Normal"]
+    tangent = nd("GeometryNodeInputTangent", 101, 16).outputs["Tangent"]
+    binormal = vmath("CROSS_PRODUCT", tangent, normal, 102, 16)
+    wave = vmath("ADD",
+                 vmath("SCALE", normal, math("SINE", phase, None, 108, 12), 103, 15),
+                 vmath("SCALE", binormal,
+                       math("MULTIPLY", math("SINE", math("MULTIPLY", phase, 0.5, 108, 14),
+                                             None, 109, 14), 0.25, 110, 14), 103, 16),
+                 104, 15)
+    shaped = set_position(shaped,
+                          vmath("ADD", nd("GeometryNodeInputPosition", 105, 15).outputs["Position"],
+                                vmath("SCALE", wave, amplitude, 106, 15), 107, 15), 101, 7)
+
+    # Thickness: slow unevenness along the strand (hand/knife cut), then a
+    # quarter-circle fillet at each cut end so caps are softened, not sharp.
+    swell = nd("ShaderNodeTexNoise", 102, 17, noise_dimensions="2D")
+    plug(swell.inputs["Vector"], xyz(math("DIVIDE", along_n,
+                                          math("MAXIMUM", math("MULTIPLY", radius, 9.0, 102, 18),
+                                               1e-9, 103, 18), 104, 18),
+                                     math("MULTIPLY", strand, NOODLE_SPREAD, 104, 19), 0.0, 105, 18))
+    plug(swell.inputs["Detail"], 2.0)
+    thickness = math("ADD", 1.0,
+                     math("MULTIPLY", math("SUBTRACT", swell.outputs["Factor"], 0.5, 106, 17),
+                          math("MULTIPLY", P["Thickness Variation"], 4.0, 106, 18), 107, 17),
+                     108, 17)
+    # Each end gets its own softness, so the two cuts of a strand differ.
+    end_noise = nd("ShaderNodeTexWhiteNoise", 102, 20, noise_dimensions="2D")
+    plug(end_noise.inputs["Vector"],
+         xyz(strand, math("GREATER_THAN", along_n, math("MULTIPLY", total, 0.5, 103, 21), 104, 21),
+             0.0, 105, 20))
+    soft = math("MULTIPLY", P["End Softness"],
+                math("ADD", 0.7, math("MULTIPLY", end_noise.outputs["Value"], 0.6, 106, 20), 107, 20),
+                108, 20)
+    t = math("MINIMUM", math("DIVIDE", end_n,
+                             math("MAXIMUM", math("MULTIPLY", soft, radius, 109, 21), 1e-9, 110, 21),
+                             111, 21), 1.0, 112, 21)
+    u = math("SUBTRACT", 1.0, t, 113, 21)
+    arc = math("SQRT", math("MAXIMUM", math("SUBTRACT", 1.0, math("MULTIPLY", u, u, 114, 21), 115, 21),
+                            0.0, 116, 21), None, 117, 21)
+    fillet = math("SUBTRACT", 1.0, math("MULTIPLY", soft, math("SUBTRACT", 1.0, arc, 118, 21), 119, 20),
+                  120, 20)
+    scale = math("MULTIPLY", radius, math("MULTIPLY", thickness, fillet, 121, 18), 122, 17)
+
+    # The centreline rides onto each ring so the mesh pass below can push
+    # vertices radially; it is removed again afterwards.
+    shaped = store(shaped, "nb_axis", nd("GeometryNodeInputPosition", 108, 8).outputs["Position"],
+                   "FLOAT_VECTOR", 109, 7)
+    to_mesh = nd("GeometryNodeCurveToMesh", 110, 7)
+    plug(to_mesh.inputs["Curve"], shaped)
+    plug(to_mesh.inputs["Profile Curve"], profile)
+    plug(pick_in(to_mesh, "Scale"), scale)
     plug(to_mesh.inputs["Fill Caps"], True)
-    smooth = nd("GeometryNodeSetShadeSmooth", 71, 1, domain="FACE")
-    plug(smooth.inputs["Mesh"], to_mesh.outputs["Mesh"])
+
+    # Edge irregularity, for ribbons: the cut edges wander in and out along
+    # the strand and the sheet is unevenly thick across its width, instead
+    # of a perfect extrusion. Vertices move radially from their own ring
+    # centre: near the edges (|x| close to the half-width) by an edge noise,
+    # elsewhere by a thickness noise that varies across the width.
+    centre = named("nb_axis", "FLOAT_VECTOR", 110, 23)
+    radial = vmath("SUBTRACT", nd("GeometryNodeInputPosition", 110, 24).outputs["Position"],
+                   centre, 111, 23)
+    prof_x, _, _ = sep(named("nb_prof", "FLOAT_VECTOR", 110, 25), 111, 25)
+    safe_r = math("MAXIMUM", radius, 1e-9, 111, 26)
+    across = math("DIVIDE", math("ABSOLUTE", prof_x, None, 112, 25), safe_r, 113, 25)
+    edge_w = math("MINIMUM", math("MAXIMUM", math("DIVIDE", math("SUBTRACT", across, 0.55, 114, 25),
+                                                  0.45, 115, 25), 0.0, 116, 25), 1.0, 117, 25)
+    edge_w = math("MULTIPLY", edge_w, edge_w, 118, 25)
+    mesh_along = named("nb_along", "FLOAT", 110, 27)
+    mesh_id = named(ATTR_ID, "INT", 110, 28)
+    fray = nd("ShaderNodeTexNoise", 112, 27, noise_dimensions="2D")
+    plug(fray.inputs["Vector"], xyz(math("DIVIDE", mesh_along, math("MULTIPLY", safe_r, 1.3, 112, 29),
+                                         113, 28),
+                                    math("MULTIPLY", mesh_id, NOODLE_SPREAD, 113, 29), 0.0, 114, 28))
+    plug(fray.inputs["Detail"], 2.0)
+    plug(fray.inputs["Roughness"], 0.55)
+    uneven = nd("ShaderNodeTexNoise", 112, 30, noise_dimensions="3D")
+    plug(uneven.inputs["Vector"], xyz(math("DIVIDE", prof_x, math("MULTIPLY", safe_r, 0.45, 113, 31),
+                                           114, 31),
+                                      math("DIVIDE", mesh_along, math("MULTIPLY", safe_r, 1.6, 113, 32),
+                                           114, 32),
+                                      math("MULTIPLY", mesh_id, NOODLE_SPREAD, 113, 33), 115, 31))
+    plug(uneven.inputs["Detail"], 2.0)
+    wobble = math("ADD",
+                  math("MULTIPLY", math("MULTIPLY", math("SUBTRACT", fray.outputs["Factor"], 0.5, 115, 27),
+                                        0.22, 116, 27), edge_w, 117, 27),
+                  math("MULTIPLY", math("MULTIPLY", math("SUBTRACT", uneven.outputs["Factor"], 0.5, 116, 30),
+                                        0.6, 117, 30),
+                       math("SUBTRACT", 1.0, edge_w, 117, 31), 118, 30), 119, 27)
+    rough_edges = set_position(
+        to_mesh.outputs["Mesh"],
+        vmath("ADD", centre,
+              vmath("SCALE", radial,
+                    math("ADD", 1.0, math("MULTIPLY", wobble, P["Edge Irregularity"], 120, 27),
+                         121, 27), 120, 23), 121, 23), 122, 22)
+    drop_axis = nd("GeometryNodeRemoveAttribute", 123, 22)
+    plug(drop_axis.inputs["Geometry"], rough_edges)
+    plug(drop_axis.inputs["Name"], "nb_axis")
+    smooth = nd("GeometryNodeSetShadeSmooth", 111, 7, domain="FACE")
+    plug(smooth.inputs["Mesh"], drop_axis.outputs["Geometry"])
     plug(smooth.inputs["Shade Smooth"], True)
-    set_mat = nd("GeometryNodeSetMaterial", 72, 1)
+    set_mat = nd("GeometryNodeSetMaterial", 112, 7)
     plug(set_mat.inputs["Geometry"], smooth.outputs["Mesh"])
     plug(set_mat.inputs["Material"], P["Noodle Material"])
-    plug(nd("NodeGroupOutput", 73, 1).inputs["Geometry"], set_mat.outputs["Geometry"])
+    plug(nd("NodeGroupOutput", 113, 7).inputs["Geometry"], set_mat.outputs["Geometry"])
     return ng
 
 
