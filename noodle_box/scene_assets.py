@@ -916,7 +916,7 @@ def _scallion_slice(verts, faces, layer, matrix, rng, size=None, depth=None):
                        rng, tau, squash, 0.5)
 
 
-def scatter_scallions(collection, target, count=38, seed=3, table_count=3):
+def scatter_scallions(collection, target, count=50, seed=3, table_count=3):
     """Drop sliced scallion rings onto the baked pile (static geometry)."""
     import random
     from mathutils.bvhtree import BVHTree
