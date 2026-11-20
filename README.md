@@ -36,9 +36,18 @@ The existing Fast / Balanced / Quality shortcuts remain available separately. Th
 
 ## Bowl demo
 
-Click **Create Bowl Demo** to create a **separate scene**, leaving your current scene intact. It contains 24 Udon strands, a watertight ceramic bowl collider, a studio surface, three lights, a camera, and timeline markers. Play forward from frame 1. Use the scene selector to return to your previous scene.
+Click **Create Bowl Demo** to create a **separate scene**, leaving your current scene intact. It is set up like a food photograph rather than a studio test, and is still created instantly (nothing is baked until you play):
 
-Alternatively open [noodle_box_demo.blend](demo/noodle_box_demo.blend). It includes the playable setup and a **Finished Preview** scene containing a static frame-100 snapshot, so the finished example is visible without rebuilding a cache. The static preview is a mesh reference, not another live solver. A short guide is included in the file's Text Editor.
+- **Bowl**: a thrown stoneware donburi, 19.9 cm across and 8.3 cm tall, with 6-9 mm walls, a rounded lip and a trimmed foot ring. A slight oval, rim undulation and radial ripple give it a hand-made wobble. It is one closed, watertight mesh and is the noodle **Collider**; walls are kept thicker than about 1.2 noodle radii so the voxelised distance field cannot leak.
+- **Glaze**: a procedural iron (kaki/tenmoku) glaze that pools dark in the well, breaks to rust over the lip and throwing ridges, with hare's-fur streaks, iron spots, pinholes and an orange-peel surface. The foot is raw, kiln-toasted clay below a wavy glaze line.
+- **Table**: procedural oiled oak boards with flat-sawn growth rings, pores, ray flecks, seams and wear. The 85 mm lens never sees an edge or horizon.
+- **Light**: a 1.1 x 0.8 m window key behind-left (110 W area light), a bounce card front-right, a black negative-fill flag and a weak overhead room fill. The glaze reflects a separate glossy-only window pane with mullions and sheer-curtain folds, and the world is a dim room gradient.
+- **Camera**: 85 mm on full frame, about 34 degrees above the table, f/3.2 focused on the *Focus - front of noodles* empty, 3:2 frame. Cycles with adaptive sampling and denoising, AgX Medium High Contrast, plus a compositor lens finish (soft vignette, fine grain).
+- **Props**: lacquered chopsticks laid on a glazed hashioki as a leading line.
+
+The pile uses 24 Udon strands, Fill Diameter 0.09 m, Start Height 0.12 m and **Spawn Coil 0.3**. Fully coiled spawns reach about 17 cm from the axis and drape over the rim; at 0.3 every strand lands in the bowl. Re-applying a noodle type restores Spawn Coil 1. Play forward from frame 1. Use the scene selector to return to your previous scene. Set assets live in `noodle_box/scene_assets.py`.
+
+Alternatively open [noodle_box_demo.blend](demo/noodle_box_demo.blend). It includes the playable setup and a **Finished Preview** scene containing a static frame-100 snapshot garnished with sliced scallions, so the finished example is visible without rebuilding a cache. The static preview is a mesh reference, not another live solver. `tools/build_demo.py` renders it at 1600 x 1067; set `NOODLE_DEMO_SAMPLES`, `NOODLE_DEMO_SIZE` (for example `750x500`) or `NOODLE_DEMO_THREADS` for a quicker check. A short guide is included in the file's Text Editor.
 
 ![Udon bowl demo](demo/udon_bowl.png)
 
@@ -142,7 +151,8 @@ Source layout:
 
 - `noodle_box/solver.py`: Geometry Nodes solver, controls, and operators.
 - `noodle_box/presets.py`: noodle type settings and materials.
-- `noodle_box/demo.py`: procedural bowl and studio scene.
+- `noodle_box/demo.py`: creates the bowl demo scene.
+- `noodle_box/scene_assets.py`: procedural bowl, glaze, oak table, lights, camera, props and garnish.
 - `noodle_box/blender_manifest.toml`: Blender extension metadata.
 - `tools/build_addon.py`: build the distributable ZIP with Python's standard library.
 - `tools/build_demo.py`: generate the `.blend` and rendered preview inside Blender.
