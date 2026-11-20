@@ -6,7 +6,7 @@ import pytest
 from noodle_box import materials, presets
 
 SURFACE_SOCKETS = ("Profile Squareness", "Waviness", "Thickness Variation",
-                   "End Softness", "Render Faces")
+                   "End Softness", "Render Faces", "Edge Irregularity")
 ZONE_NODES = {"GeometryNodeSimulationInput", "GeometryNodeSimulationOutput",
               "GeometryNodeRepeatInput", "GeometryNodeRepeatOutput"}
 
@@ -135,3 +135,25 @@ def test_waviness_moves_only_the_display_surface(noodle):
     assert np.allclose(flat["np_vel"], wavy["np_vel"])
     assert np.allclose(flat["nb_along"], wavy["nb_along"])
     assert np.abs(flat["co"] - wavy["co"]).max() > 0.001
+
+
+def test_edge_irregularity_roughens_ribbon_edges_only_on_display(noodle):
+    """Ribbon edges wander with Edge Irregularity; simulation state does not."""
+    results = []
+    for amount in (0.0, 1.0):
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        ng = noodle.build_group()
+        obj = noodle.build_object(ng)
+        presets.apply_type(obj, "rice_ribbon", bpy.context.scene)
+        noodle.set_input(obj, ng, "Noodle Count", 2)
+        noodle.set_input(obj, ng, "Edge Irregularity", amount)
+        for frame in range(1, 6):
+            bpy.context.scene.frame_set(frame)
+        results.append(evaluated_arrays(obj, "np_vel"))
+        assert "nb_axis" not in obj.evaluated_get(
+            bpy.context.evaluated_depsgraph_get()).data.attributes
+    clean, rough = results
+    assert np.allclose(clean["np_vel"], rough["np_vel"])
+    moved = np.linalg.norm(clean["co"] - rough["co"], axis=1)
+    radius = presets.NOODLE_TYPES["rice_ribbon"]["radius"]
+    assert 0.002 * radius < moved.max() < 0.25 * radius
