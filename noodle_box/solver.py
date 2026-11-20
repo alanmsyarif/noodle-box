@@ -95,6 +95,8 @@ ATTR_CNRM = "np_cnrm"      # outward normal of the nearest collider surface
 ATTR_SPUSH = "np_spush"    # this substep's contact push from the floor and colliders
 ATTR_NPUSH = "np_npush"    # this substep's contact push from other noodles
 ATTR_NEAR2 = "np_near2"    # a second neighbour, from the other half of the query
+ATTR_DRIFT = "np_drift"    # running mean of the displacement per substep
+ATTR_HOLD = "np_hold"      # 1 where a resting point is also held in place
 ATTR_REST = "np_rest"      # 1 where a point is held at rest by static friction this substep
 ATTR_AGE = "np_age"        # seconds since the spawn
 ATTR_BREST = "np_brest"    # plastically set rest bend (offset from the neighbours' midpoint)
@@ -129,7 +131,7 @@ SDF_BAND = 6
 # vertex of the tube, interpolated, for data nothing downstream reads. Stripped
 # before the surface; np_id and np_vel are deliberately kept, because they are
 # genuinely useful in a shader.
-SCRATCH_ATTRS = (ATTR_NEAR2, ATTR_REST, ATTR_AGE, ATTR_BREST, ATTR_PREV, ATTR_NEAR, ATTR_CDIST, ATTR_CNRM, ATTR_SPUSH, ATTR_NPUSH, ATTR_SFRIC,
+SCRATCH_ATTRS = (ATTR_HOLD, ATTR_DRIFT, ATTR_NEAR2, ATTR_REST, ATTR_AGE, ATTR_BREST, ATTR_PREV, ATTR_NEAR, ATTR_CDIST, ATTR_CNRM, ATTR_SPUSH, ATTR_NPUSH, ATTR_SFRIC,
                  ATTR_SDIR, ATTR_SABC, ATTR_SD,
                  ATTR_BEND_AC, ATTR_BEND_B, ATTR_BEND_E, ATTR_BEND_Y, ATTR_BEND_S,
                  ATTR_BEND_DRE, ATTR_BEND_DIM, ATTR_BEND_TMP_E, ATTR_BEND_TMP_AC,
@@ -171,7 +173,9 @@ SPAWN_WAVE = 0.07          # m of strand over which the waviness varies
 SPAWN_WAVE_RADIAL = 0.3    # in/out waviness, in diameters per unit of noise, at Spawn Coil 1
 SPAWN_WAVE_HEIGHT = 0.3    # up/down waviness, in diameters per unit of noise, at Spawn Coil 1
 SPAWN_RINGS = 3            # concentric loops per level of the coil
-SPAWN_SETTLE = 0.1    # seconds the spawned strands untangle before they fall
+SPAWN_SETTLE = 0.1        # seconds the spawned strands untangle before they fall
+SPAWN_LOWER_TIME = 1.5    # seconds the portion is lowered in rather than dropped
+SPAWN_LOWER_SPEED = 0.4   # m/s, the lowering speed
 
 # ------------------------------------------------------------ material model
 # Cooked wheat noodles are about as dense as water with a little starch in it.
@@ -200,12 +204,14 @@ PLASTIC_TIME = 0.4
 
 
 # Adaptive substeps keep a resting point's per-step gravity sag below this
-# fraction of the radius.
-SAG_FRACTION = 0.05
+# fraction of the radius. 0.05 measured the same settled heap for 20% more time.
+SAG_FRACTION = 0.1
+
+# Share of a noodle contact's overlap a point resolves itself: CONTACT_SHARE,
+# plus STACK_SHARE times the upward component of the contact normal, so the
+# strand on top moves more (shock propagation).
 CONTACT_SHARE = 0.5
 STACK_SHARE = 0.45
-BEND_LAST = True
-SECOND_CONTACT = True
 
 # Sockets whose meaning changed in solver revision 5; upgrades reset them.
 REVISION_5_PHYSICS = ("Damping", "Contact Damping", "Stiffness", "Friction")
@@ -213,9 +219,11 @@ REVISION_5_PHYSICS = ("Damping", "Contact Damping", "Stiffness", "Friction")
 # Default for the Contact Damping socket.
 DEFAULT_CONTACT_DAMPING = 1.0
 
-# Contact Damping only acts below this fraction of sqrt(g r): sub-millimetre
-# buzz, not slumping or sliding.
-SETTLE_FRACTION = 0.25
+# Coming to rest: a point in contact whose mean drift over SETTLE_TIME
+# seconds is slower than SETTLE_FRACTION * sqrt(g r) (44 mm/s for udon) is
+# held still, unless it is sliding on a surface faster than friction allows.
+SETTLE_FRACTION = 0.2
+SETTLE_TIME = 0.3
 
 # Contact skin, as a fraction of the radius. Anything a point comes this close
 # to counts as touching, for friction purposes.
@@ -312,17 +320,17 @@ DESCRIPTIONS = {
     "End Softness": "Rounds the cut ends instead of a sharp flat cap; fraction of the radius. Display only",
     "Render Faces": "Tube sides used for final renders; the viewport keeps Profile Faces. Display only",
     "Edge Irregularity": "Wandering cut edges and uneven thickness across the width, for ribbons. Display only",
-    "Fill Diameter": "Diameter of the spawn disc in metres",
+    "Fill Diameter": "Outer diameter of the spawned coil of loops in metres; keep it inside the bowl",
     "Start Height": "Spawn origin above the local floor in metres; coils can extend below this",
-    "Spawn Coil": "How much each strand meanders when dropped: 1 lazy curves, 0 upright straight rods",
+    "Spawn Coil": "Spawn as a portion lowered in as a coil of broad loops (1 waviest); 0 drops upright straight rods",
     "Seed": "Repeatable random layout and strand lengths",
     "Gravity": "Downward acceleration in metres per second squared; Earth gravity is 9.81",
     "Damping": "Extra air drag per 1/24 second on top of the physical drag every noodle feels; 0 falls at true gravity",
-    "Contact Damping": "Settle residual contact buzz below a tenth of sqrt(gravity x radius); sliding, slumping and free fall are unaffected",
+    "Contact Damping": "Let a resting heap come to rest: a point in contact drifting slower than about 4 cm/s (udon) is held still; a strand sliding faster than its friction allows never is. 0 disables",
     "Stiffness": "Bending stiffness as Young's modulus on a log scale: 0 = 10 kPa (overcooked), 0.33 = 100 kPa (udon), 0.77 = 2 MPa (al dente), 1 = 10 MPa",
     "Adaptive Substeps": "Use current maximum speed plus gravity to spend fewer substeps on slow frames",
     "Substeps": "Maximum steps per frame (1 to 24). Too few clamp fall speed. Use Fit Step Budget after changing scale or FPS",
-    "Iterations": "Constraint passes per substep (1 to 12). Stretch and bending are solved exactly in each pass; 2 is plenty",
+    "Iterations": "Contact passes per substep (1 to 12). Stretch is solved exactly in each pass and bending exactly after them; 2 is plenty",
     "Self Collision": "Noodle contact strength; 0 allows strands to pass through one another",
     "Friction": "Coulomb friction coefficient between noodles and on the floor; a strand holds on slopes below atan(Friction). Wet pasta is about 0.2-0.4",
     "Cohesion": "Starch stickiness: pull towards a strand within 1.8 diameters, as a fraction of gravity; 0 is dry",
@@ -1126,8 +1134,6 @@ def build_group():
     for k, (attr, group) in enumerate(((ATTR_NEAR, math("FLOORED_MODULO", math("ADD", sp_it, id_it, 37, 7),
                                                          2.0, 38, 7)),
                                        (ATTR_NEAR2, math("FLOORED_MODULO", sp_it, 2.0, 38, 8)))):
-        if k and not SECOND_CONTACT:
-            break
         near_it = nd("GeometryNodeIndexOfNearest", 39, 6 + k)
         plug(near_it.inputs["Position"], position)
         plug(near_it.inputs["Group ID"], group)
@@ -1261,9 +1267,6 @@ def build_group():
         return solve
 
 
-    if not BEND_LAST:
-        solve = bending(solve)
-
     # -- inextensibility, solved exactly along each strand.
     # A noodle does not stretch measurably under its own weight. Solved as
     # local distance constraints (Jacobi, two iterations) the length error
@@ -1280,70 +1283,74 @@ def build_group():
     # decouple it completely. One solve projects the whole strand to its rest
     # length the way a mass-weighted projection should, conserving momentum,
     # and the tension it carries is the weight of everything hanging below.
-    u = vmath("NORMALIZE", vmath("SUBTRACT", position, prev_p, 70, 7), None, 71, 7)
-    seg_len = vmath("LENGTH", vmath("SUBTRACT", position, prev_p, 70, 8), None, 71, 8)
-    solve = store(solve, ATTR_SDIR, vmath("SCALE", u, has_prev, 72, 7), "FLOAT_VECTOR", 72, 1)
-    u_s = named(ATTR_SDIR, "FLOAT_VECTOR", 73, 6)
-    u_prev = at_index(u_s, math("SUBTRACT", index, 1, 73, 7), "FLOAT_VECTOR", 74, 7)
-    u_next = at_index(u_s, math("ADD", index, 1, 73, 8), "FLOAT_VECTOR", 74, 8)
-    row_a = math("MULTIPLY", math("MULTIPLY", vmath("DOT_PRODUCT", u_prev, u_s, 75, 7), -1.0, 76, 7),
-                 has_prev2_row, 77, 7)
-    row_c = math("MULTIPLY", math("MULTIPLY", vmath("DOT_PRODUCT", u_next, u_s, 75, 8), -1.0, 76, 8),
-                 math("MULTIPLY", has_prev, has_next, 76, 9), 77, 8)
-    row_b = math("ADD", 1.0, has_prev, 75, 9)  # 2 for a real row, 1 for the dummy at spline start
-    row_d = math("MULTIPLY", math("SUBTRACT", rest, seg_len, 75, 10), has_prev, 76, 10)
-    solve = store(solve, ATTR_SD, row_d, "FLOAT", 78, 1)
-    solve = store(solve, ATTR_SABC, xyz(row_a, row_b, row_c, 78, 8), "FLOAT_VECTOR", 79, 1)
+    def stretching(solve):
+        u = vmath("NORMALIZE", vmath("SUBTRACT", position, prev_p, 70, 7), None, 71, 7)
+        seg_len = vmath("LENGTH", vmath("SUBTRACT", position, prev_p, 70, 8), None, 71, 8)
+        solve = store(solve, ATTR_SDIR, vmath("SCALE", u, has_prev, 72, 7), "FLOAT_VECTOR", 72, 1)
+        u_s = named(ATTR_SDIR, "FLOAT_VECTOR", 73, 6)
+        u_prev = at_index(u_s, math("SUBTRACT", index, 1, 73, 7), "FLOAT_VECTOR", 74, 7)
+        u_next = at_index(u_s, math("ADD", index, 1, 73, 8), "FLOAT_VECTOR", 74, 8)
+        row_a = math("MULTIPLY", math("MULTIPLY", vmath("DOT_PRODUCT", u_prev, u_s, 75, 7), -1.0, 76, 7),
+                     has_prev2_row, 77, 7)
+        row_c = math("MULTIPLY", math("MULTIPLY", vmath("DOT_PRODUCT", u_next, u_s, 75, 8), -1.0, 76, 8),
+                     math("MULTIPLY", has_prev, has_next, 76, 9), 77, 8)
+        row_b = math("ADD", 1.0, has_prev, 75, 9)  # 2 for a real row, 1 for the dummy at spline start
+        row_d = math("MULTIPLY", math("SUBTRACT", rest, seg_len, 75, 10), has_prev, 76, 10)
+        solve = store(solve, ATTR_SD, row_d, "FLOAT", 78, 1)
+        solve = store(solve, ATTR_SABC, xyz(row_a, row_b, row_c, 78, 8), "FLOAT_VECTOR", 79, 1)
 
-    pcr_in = nd("GeometryNodeRepeatInput", 80, 2)
-    pcr_out = nd("GeometryNodeRepeatOutput", 86, 2)
-    pcr_in.pair_with_output(pcr_out)
-    plug(pcr_in.inputs["Iterations"], pcr_rounds)
-    plug(pcr_in.inputs["Geometry"], solve)
-    stride = math("POWER", 2.0, pcr_in.outputs["Iteration"], 80, 4)
-    abc = named(ATTR_SABC, "FLOAT_VECTOR", 80, 5)
-    dd = named(ATTR_SD, "FLOAT", 80, 6)
-    lo_ok = math("GREATER_THAN", math("SUBTRACT", spline_i, stride, 81, 7), -0.5, 82, 7)
-    hi_ok = math("LESS_THAN", math("ADD", spline_i, stride, 81, 8),
-                 math("SUBTRACT", point_count, 0.5, 81, 9), 82, 8)
-    lo_i = math("SUBTRACT", index, stride, 81, 10)
-    hi_i = math("ADD", index, stride, 81, 11)
-    # Rows outside the strand read as the identity row (0, 1, 0 | 0).
-    identity = (0.0, 1.0, 0.0)
-    abc_lo = mix_vec(lo_ok, identity, at_index(abc, lo_i, "FLOAT_VECTOR", 82, 10), 83, 10)
-    abc_hi = mix_vec(hi_ok, identity, at_index(abc, hi_i, "FLOAT_VECTOR", 82, 11), 83, 11)
-    d_lo = math("MULTIPLY", at_index(dd, lo_i, "FLOAT", 82, 12), lo_ok, 83, 12)
-    d_hi = math("MULTIPLY", at_index(dd, hi_i, "FLOAT", 82, 13), hi_ok, 83, 13)
-    a0, b0, c0 = sep(abc, 81, 5)
-    al, bl, cl = sep(abc_lo, 84, 10)
-    ah, bh, ch = sep(abc_hi, 84, 11)
-    k1 = math("DIVIDE", a0, bl, 85, 10)
-    k2 = math("DIVIDE", c0, bh, 85, 11)
-    d_new = math("SUBTRACT", dd,
-                 math("ADD", math("MULTIPLY", d_lo, k1, 86, 12),
-                      math("MULTIPLY", d_hi, k2, 86, 13), 87, 12), 88, 12)
-    abc_new = xyz(math("MULTIPLY", math("MULTIPLY", al, k1, 86, 7), -1.0, 87, 7),
-                  math("SUBTRACT", b0,
-                       math("ADD", math("MULTIPLY", cl, k1, 86, 8),
-                            math("MULTIPLY", ah, k2, 86, 9), 87, 8), 88, 8),
-                  math("MULTIPLY", math("MULTIPLY", ch, k2, 86, 10), -1.0, 87, 10), 89, 8)
-    # d first: it reads the old coefficients, which the second store replaces.
-    reduced = store(pcr_in.outputs["Geometry"], ATTR_SD, d_new, "FLOAT", 84, 2)
-    reduced = store(reduced, ATTR_SABC, abc_new, "FLOAT_VECTOR", 85, 2)
-    plug(pcr_out.inputs["Geometry"], reduced)
-    solve = pcr_out.outputs["Geometry"]
+        pcr_in = nd("GeometryNodeRepeatInput", 80, 2)
+        pcr_out = nd("GeometryNodeRepeatOutput", 86, 2)
+        pcr_in.pair_with_output(pcr_out)
+        plug(pcr_in.inputs["Iterations"], pcr_rounds)
+        plug(pcr_in.inputs["Geometry"], solve)
+        stride = math("POWER", 2.0, pcr_in.outputs["Iteration"], 80, 4)
+        abc = named(ATTR_SABC, "FLOAT_VECTOR", 80, 5)
+        dd = named(ATTR_SD, "FLOAT", 80, 6)
+        lo_ok = math("GREATER_THAN", math("SUBTRACT", spline_i, stride, 81, 7), -0.5, 82, 7)
+        hi_ok = math("LESS_THAN", math("ADD", spline_i, stride, 81, 8),
+                     math("SUBTRACT", point_count, 0.5, 81, 9), 82, 8)
+        lo_i = math("SUBTRACT", index, stride, 81, 10)
+        hi_i = math("ADD", index, stride, 81, 11)
+        # Rows outside the strand read as the identity row (0, 1, 0 | 0).
+        identity = (0.0, 1.0, 0.0)
+        abc_lo = mix_vec(lo_ok, identity, at_index(abc, lo_i, "FLOAT_VECTOR", 82, 10), 83, 10)
+        abc_hi = mix_vec(hi_ok, identity, at_index(abc, hi_i, "FLOAT_VECTOR", 82, 11), 83, 11)
+        d_lo = math("MULTIPLY", at_index(dd, lo_i, "FLOAT", 82, 12), lo_ok, 83, 12)
+        d_hi = math("MULTIPLY", at_index(dd, hi_i, "FLOAT", 82, 13), hi_ok, 83, 13)
+        a0, b0, c0 = sep(abc, 81, 5)
+        al, bl, cl = sep(abc_lo, 84, 10)
+        ah, bh, ch = sep(abc_hi, 84, 11)
+        k1 = math("DIVIDE", a0, bl, 85, 10)
+        k2 = math("DIVIDE", c0, bh, 85, 11)
+        d_new = math("SUBTRACT", dd,
+                     math("ADD", math("MULTIPLY", d_lo, k1, 86, 12),
+                          math("MULTIPLY", d_hi, k2, 86, 13), 87, 12), 88, 12)
+        abc_new = xyz(math("MULTIPLY", math("MULTIPLY", al, k1, 86, 7), -1.0, 87, 7),
+                      math("SUBTRACT", b0,
+                           math("ADD", math("MULTIPLY", cl, k1, 86, 8),
+                                math("MULTIPLY", ah, k2, 86, 9), 87, 8), 88, 8),
+                      math("MULTIPLY", math("MULTIPLY", ch, k2, 86, 10), -1.0, 87, 10), 89, 8)
+        # d first: it reads the old coefficients, which the second store replaces.
+        reduced = store(pcr_in.outputs["Geometry"], ATTR_SD, d_new, "FLOAT", 84, 2)
+        reduced = store(reduced, ATTR_SABC, abc_new, "FLOAT_VECTOR", 85, 2)
+        plug(pcr_out.inputs["Geometry"], reduced)
+        solve = pcr_out.outputs["Geometry"]
 
-    _, b_fin, _ = sep(named(ATTR_SABC, "FLOAT_VECTOR", 87, 4), 88, 4)
-    lam_s = math("DIVIDE", named(ATTR_SD, "FLOAT", 87, 5), b_fin, 89, 4)
-    solve = store(solve, ATTR_SD, lam_s, "FLOAT", 90, 1)
-    lam_st = named(ATTR_SD, "FLOAT", 90, 5)
-    stretch_fix = vmath("SUBTRACT",
-                        vmath("SCALE", u_s, lam_st, 91, 5),
-                        vmath("SCALE", u_next,
-                              math("MULTIPLY",
-                                   at_index(lam_st, math("ADD", index, 1, 90, 6), "FLOAT", 91, 6),
-                                   has_next, 92, 6), 92, 7), 93, 5)
-    solve = set_position(solve, vmath("ADD", position, stretch_fix, 94, 5), 95, 1)
+        _, b_fin, _ = sep(named(ATTR_SABC, "FLOAT_VECTOR", 87, 4), 88, 4)
+        lam_s = math("DIVIDE", named(ATTR_SD, "FLOAT", 87, 5), b_fin, 89, 4)
+        solve = store(solve, ATTR_SD, lam_s, "FLOAT", 90, 1)
+        lam_st = named(ATTR_SD, "FLOAT", 90, 5)
+        stretch_fix = vmath("SUBTRACT",
+                            vmath("SCALE", u_s, lam_st, 91, 5),
+                            vmath("SCALE", u_next,
+                                  math("MULTIPLY",
+                                       at_index(lam_st, math("ADD", index, 1, 90, 6), "FLOAT", 91, 6),
+                                       has_next, 92, 6), 92, 7), 93, 5)
+        solve = set_position(solve, vmath("ADD", position, stretch_fix, 94, 5), 95, 1)
+        return solve
+
+    solve = stretching(solve)
 
     # -- push apart noodles that overlap.
     # Index of Nearest excludes only the point itself, so a point's own chain
@@ -1446,8 +1453,7 @@ def build_group():
         return solve
 
     solve = self_push(solve, ATTR_NEAR)
-    if SECOND_CONTACT:
-        solve = self_push(solve, ATTR_NEAR2)
+    solve = self_push(solve, ATTR_NEAR2)
 
     # -- floor. A hard constraint, so it belongs inside the loop.
     px, py, pz = sep(position, 56, 6)
@@ -1555,10 +1561,12 @@ def build_group():
                   mix_vec(math("LESS_THAN", d_stick, d_plain, 93, 13), n_plain, n_stick, 94, 13),
                   "FLOAT_VECTOR", 95, 12)
 
-    if BEND_LAST:
-        solve = bending(solve)
     plug(rep_out.inputs["Geometry"], solve)
     state = rep_out.outputs["Geometry"]
+    # Bending once per substep, after the contact passes, so that supports
+    # never leave a kink in a strand's shape. Solving it inside every pass
+    # measured the same settled heap for 10% more time per frame.
+    state = bending(state)
 
     # ---------------------------------------------- velocity, then friction
     # Velocity is whatever motion survived the constraints. Friction acts
@@ -1584,7 +1592,6 @@ def build_group():
     prev_pos = named(ATTR_PREV, "FLOAT_VECTOR", 64, 3)
     inv_dt = math("DIVIDE", 1.0, math("MAXIMUM", dt, 1e-6, 65, 4), 66, 4)
     velocity_out = vmath("SCALE", vmath("SUBTRACT", position, prev_pos, 65, 3), inv_dt, 67, 3)
-    raw_velocity = velocity_out
 
 
     _, _, fz = sep(position, 64, 6)
@@ -1611,17 +1618,6 @@ def build_group():
     on_collider = math("LESS_THAN", named(ATTR_CDIST, "FLOAT", 64, 11),
                        math("MULTIPLY", P["Noodle Radius"], CONTACT_SKIN, 65, 12), 67, 11)
 
-    def holds(v, normal, mu, gate, push_attr, col, row):
-        """1 where static friction can hold this contact: the sliding speed
-        is within what mu times the normal impulse can stop this substep."""
-        vt = vmath("SUBTRACT", v, vmath("SCALE", normal, vmath("DOT_PRODUCT", v, normal, col, row),
-                                        col + 1, row), col + 2, row)
-        budget = math("MULTIPLY", math("MULTIPLY", named(push_attr, "FLOAT", col, row + 1), inv_dt,
-                                       col + 1, row + 1), mu, col + 2, row + 1)
-        return math("MULTIPLY", gate,
-                    math("GREATER_THAN", budget, vmath("LENGTH", vt, None, col + 3, row), col + 3, row + 1),
-                    col + 4, row)
-
     def coulomb(v, normal, mu, gate, push_attr, col, row, share=1.0):
         """Remove up to mu * (normal impulse) of `share` of the sliding part of v."""
         vn = vmath("SCALE", normal, vmath("DOT_PRODUCT", v, normal, col, row), col + 1, row)
@@ -1647,6 +1643,15 @@ def build_group():
     surface_mu = pick_out(mu_mix, "Result")
     surface_gate = math("MAXIMUM", on_floor, on_collider, 67, 17)
     surface_cut = coulomb(velocity_out, surface_normal, surface_mu, surface_gate, ATTR_SPUSH, 68, 16)
+    # Sliding on a floor or collider: friction could not stop it this substep.
+    surface_slips = math("MULTIPLY", surface_gate,
+                         math("GREATER_THAN",
+                              vmath("LENGTH", vmath("SUBTRACT", velocity_out,
+                                                    vmath("SCALE", surface_normal,
+                                                          vmath("DOT_PRODUCT", velocity_out, surface_normal,
+                                                                66, 52), 67, 52), 68, 52), None, 69, 52),
+                              math("MULTIPLY", math("MULTIPLY", named(ATTR_SPUSH, "FLOAT", 66, 53), inv_dt, 67, 53),
+                                   surface_mu, 68, 53), 70, 52), 71, 52)
     velocity_out = vmath("SUBTRACT", velocity_out, surface_cut, 75, 16)
     # Surface friction acts on this substep's displacement too, not only on
     # the velocity carried into the next one: otherwise every substep's
@@ -1702,44 +1707,73 @@ def build_group():
     # another; for the first SPAWN_SETTLE seconds the contact solve untangles
     # them with velocity held at zero, so the overlap is pushed apart instead
     # of being turned into speed that flung strands out of the bowl.
+    #
+    # Then the portion is lowered in, as with tongs, rather than dropped:
+    # for SPAWN_LOWER_TIME seconds no point moves faster than
+    # SPAWN_LOWER_SPEED. Dropped from the top of its coil, a full serving hit
+    # the bowl at over 2 m/s and splashed strands over the rim. Both apply
+    # only to the poured spawn (Spawn Coil above 0); upright rods drop freely.
+    age = named(ATTR_AGE, "FLOAT", 72, 30)
+    poured_spawn = math("GREATER_THAN", P["Spawn Coil"], 0.0, 72, 31)
+    held = math("MULTIPLY", poured_spawn, math("LESS_THAN", age, SPAWN_SETTLE, 73, 31), 74, 31)
+    lowering = math("MULTIPLY", poured_spawn, math("LESS_THAN", age, SPAWN_LOWER_TIME, 73, 32), 74, 32)
+    cap = math("MINIMUM", 1.0,
+               math("DIVIDE", SPAWN_LOWER_SPEED,
+                    math("MAXIMUM", vmath("LENGTH", velocity_out, None, 73, 33), 1e-6, 74, 33), 75, 33),
+               76, 33)
     velocity_out = vmath("SCALE", velocity_out,
-                         math("GREATER_THAN", named(ATTR_AGE, "FLOAT", 72, 30), SPAWN_SETTLE, 73, 30),
+                         math("MULTIPLY", math("SUBTRACT", 1.0, held, 75, 31),
+                              math("ADD", math("SUBTRACT", 1.0, lowering, 76, 32),
+                                   math("MULTIPLY", lowering, cap, 77, 32), 78, 32), 79, 31),
                          74, 30)
     state = store(state, ATTR_VEL, velocity_out, "FLOAT_VECTOR", 74, 1)
     damped = named(ATTR_VEL, "FLOAT_VECTOR", 75, 21)
 
     # Coming to rest. A position-based contact solve never balances forces
-    # exactly, so a pile whose contacts all hold by static friction still
-    # trades a few mm/s back and forth between substeps - a pile that never
-    # settles. Where static friction holds a point on its support and it is
-    # moving slower than SETTLE_FRACTION * sqrt(g r), it is at rest: Contact
-    # Damping removes that residual speed. A point whose friction cannot hold
-    # (a slope steeper than its friction angle, a strand dragged by another)
-    # is never touched, so sliding and slumping start and run as Coulomb
-    # says; the old version damped every slow contact and froze strands in
-    # mid-slump.
-    at_rest = math("MULTIPLY",
-                   math("MAXIMUM",
-                        holds(raw_velocity, surface_normal, surface_mu, surface_gate, ATTR_SPUSH, 72, 40),
-                        holds(vmath("SUBTRACT", raw_velocity, near_vel, 71, 44), contact_normal,
-                              P["Friction"], touching, ATTR_NPUSH, 72, 44), 77, 40),
-                   math("LESS_THAN", vmath("LENGTH", damped, None, 72, 48),
+    # exactly, so a heap in which every strand is held still trades a few
+    # mm/s back and forth between substeps and never settles. That residual
+    # has no direction; real motion does. So each point keeps a running mean
+    # of its displacement per substep over about SETTLE_TIME seconds, and a
+    # point in contact whose mean drift is slower than SETTLE_FRACTION *
+    # sqrt(g r) is at rest: Contact Damping keeps it where it was and clears
+    # its velocity. A strand that should slide - a slope steeper than its
+    # friction angle, a strand dragged by another - drifts steadily, far above
+    # that speed within a few substeps, and is never held. The old version
+    # damped every slow contact and froze strands in mid-slump.
+    step_now = vmath("SUBTRACT",
+                     vmath("SUBTRACT", position, named(ATTR_SFRIC, "FLOAT_VECTOR", 70, 46), 71, 46),
+                     prev_pos, 72, 46)
+    drift_mix = math("SUBTRACT", 1.0,
+                     math("EXPONENT", math("DIVIDE", math("MULTIPLY", dt, -1.0, 70, 47), SETTLE_TIME, 71, 47),
+                          None, 72, 47), 73, 47)
+    drift_old = named(ATTR_DRIFT, "FLOAT_VECTOR", 70, 48)
+    state = store(state, ATTR_DRIFT,
+                  vmath("ADD", drift_old, vmath("SCALE", vmath("SUBTRACT", step_now, drift_old, 73, 48),
+                                                drift_mix, 74, 48), 75, 48), "FLOAT_VECTOR", 76, 0)
+    in_contact = touching
+    at_rest = math("MULTIPLY", math("MULTIPLY", in_contact, math("SUBTRACT", 1.0, surface_slips, 70, 53), 71, 53),
+                   math("LESS_THAN",
+                        math("MULTIPLY", vmath("LENGTH", named(ATTR_DRIFT, "FLOAT_VECTOR", 72, 50), None, 73, 50),
+                             inv_dt, 74, 50),
                         math("MULTIPLY",
-                             math("SQRT", math("MULTIPLY", P["Gravity"], P["Noodle Radius"], 72, 49),
-                                  None, 73, 49), SETTLE_FRACTION, 74, 49), 75, 48), 78, 40)
+                             math("SQRT", math("MULTIPLY", P["Gravity"], P["Noodle Radius"], 72, 51),
+                                  None, 73, 51), SETTLE_FRACTION, 74, 51), 75, 50), 78, 40)
     state = store(state, ATTR_REST, math("MULTIPLY", at_rest, P["Contact Damping"], 79, 41),
                   "FLOAT", 80, 0)
+    # Only points resting on other noodles are also held in place; on a floor
+    # or collider only their speed is cleared. Holding a strand's points on a
+    # rod while its tails moved broke its length constraints, and a strand
+    # hanging over a chopstick slid off it.
+    state = store(state, ATTR_HOLD, math("MULTIPLY", named(ATTR_REST, "FLOAT", 80, 44),
+                                         math("SUBTRACT", 1.0, surface_gate, 79, 45), 80, 45),
+                  "FLOAT", 81, 0)
     resting = named(ATTR_REST, "FLOAT", 80, 42)
     state = store(state, ATTR_VEL, vmath("SCALE", damped, math("SUBTRACT", 1.0, resting, 80, 43), 78, 14),
                   "FLOAT_VECTOR", 81, 1)
-    # A point at rest also keeps its place: what the solve moved it by this
-    # substep is residual, not motion, and left in it made the pile tremble.
-    state = set_position(state,
-                         mix_vec(resting,
-                                 vmath("SUBTRACT", position, named(ATTR_SFRIC, "FLOAT_VECTOR", 79, 15), 81, 15),
-                                 named(ATTR_PREV, "FLOAT_VECTOR", 80, 16), 82, 15), 82, 1)
+    state = set_position(state, vmath("SUBTRACT", position, named(ATTR_SFRIC, "FLOAT_VECTOR", 79, 15),
+                                      81, 15), 82, 1)
 
-    # Post-stabilisation. Bending is solved last in each iteration so the
+    # Post-stabilisation. Bending is solved after the contact passes so the
     # strand's shape is never left kinked by a support, but that can leave a
     # point a fraction of a millimetre inside a contact. Resolving it here,
     # after velocity has been read back, removes the overlap without turning
@@ -1767,6 +1801,12 @@ def build_group():
                          84, 2)
     state, _, _ = collider_pass(state, grid, 0.0, has_plain, 85, 28, accumulate=False)
     state, _, _ = collider_pass(state, sticky_grid, 0.0, has_sticky, 85, 36, accumulate=False)
+
+    # A point at rest also keeps its place, after every correction of this
+    # substep: what the solve and the overlap pass moved it by is residual,
+    # not motion, and left in it made the heap tremble.
+    state = set_position(state, mix_vec(named(ATTR_HOLD, "FLOAT", 84, 44), position,
+                                        named(ATTR_PREV, "FLOAT_VECTOR", 84, 45), 85, 44), 86, 44)
 
     # -- plasticity. Cooked dough is viscoplastic: a bend that is held sets.
     # Each joint's rest bend creeps towards PLASTIC_SET of its current bend
