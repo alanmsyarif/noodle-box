@@ -1,16 +1,27 @@
-"""Run in Blender to save the playable demo and a rendered static preview."""
+"""Run in Blender to save the playable demo and a rendered static preview.
+
+Environment overrides for quick checks: NOODLE_DEMO_SAMPLES, NOODLE_DEMO_SIZE
+(e.g. "750x500"), NOODLE_DEMO_THRESHOLD, NOODLE_DEMO_THREADS.
+"""
+import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import bpy
-from noodle_box import solver
+from noodle_box import scene_assets, solver
 from noodle_box.demo import create_demo
 
 DEST = ROOT / "demo"
 DEST.mkdir(exist_ok=True)
+SAMPLES = int(os.environ.get("NOODLE_DEMO_SAMPLES", 512))
+THRESHOLD = float(os.environ.get("NOODLE_DEMO_THRESHOLD", 0.008))
+SIZE = tuple(int(v) for v in os.environ.get("NOODLE_DEMO_SIZE", "1600x1067").split("x"))
+THREADS = int(os.environ.get("NOODLE_DEMO_THREADS", 0))
+
 solver.register()
 scene, noodles, bowl = create_demo(bpy.context)
 for frame in range(1, 101):
@@ -19,26 +30,20 @@ for frame in range(1, 101):
 
 # A mesh snapshot guarantees that the downloaded file includes a finished
 # example without relying on temporary simulation caches surviving a save.
-evaluated = noodles.evaluated_get(bpy.context.evaluated_depsgraph_get())
-mesh = bpy.data.meshes.new_from_object(evaluated, depsgraph=bpy.context.evaluated_depsgraph_get())
-snapshot = bpy.data.objects.new("Udon - static frame 100 preview", mesh)
-preview = bpy.data.scenes.new("Noodle Box - Finished Preview")
-for obj in scene.objects:
-    if obj != noodles:
-        preview.collection.objects.link(obj)
-preview.collection.objects.link(snapshot)
-preview.camera = scene.camera
-preview.world = scene.world
-preview.unit_settings.system = "METRIC"
-preview.render.engine = "CYCLES"
-preview.cycles.samples = 48
-preview.cycles.use_denoising = True
-preview.view_settings.view_transform = "AgX"
-preview.render.resolution_x, preview.render.resolution_y = 1200, 900
-preview.render.resolution_percentage = 100
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = noodles.evaluated_get(depsgraph)
+mesh = bpy.data.meshes.new_from_object(evaluated, depsgraph=depsgraph)
+# The static preview adds scallion garnish scattered onto the baked pile.
+preview, snapshot = scene_assets.make_preview_scene(scene, noodles, mesh, SAMPLES, SIZE)
+preview.cycles.adaptive_threshold = THRESHOLD
+if THREADS:
+    preview.render.threads_mode = "FIXED"
+    preview.render.threads = THREADS
 preview.render.filepath = str(DEST / "udon_bowl.png")
 bpy.context.window.scene = preview
+started = time.time()
 bpy.ops.render.render(write_still=True)
+print("RENDER_SECONDS", round(time.time() - started, 1))
 
 # Open the deliverable on the playable scene, ready to start at frame 1.
 bpy.context.window.scene = scene
